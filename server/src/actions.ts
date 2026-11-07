@@ -67,11 +67,24 @@ function parseJsonArray(raw: string): string[] {
   }
 }
 
+// Resolving one photo link must never fail the whole recipe list: if a
+// stored photo's link cannot be resolved (missing/unreadable blob), that
+// recipe simply renders without a photo instead of the entire library
+// erroring out — the failure mode behind "the images are failing to load".
+async function safePhotoUrl(ctx: Ctx, key: string | null): Promise<string | null> {
+  if (!key) return null;
+  try {
+    return await ctx.blobs.getUrl(key);
+  } catch {
+    return null;
+  }
+}
+
 async function toDto(ctx: Ctx, row: RecipeRow): Promise<z.infer<typeof recipeDto>> {
   const [dishPhotoUrl, scanPhotoUrl, sourcePhotoUrl] = await Promise.all([
-    row.dishPhotoKey ? ctx.blobs.getUrl(row.dishPhotoKey) : Promise.resolve(null),
-    row.scanPhotoKey ? ctx.blobs.getUrl(row.scanPhotoKey) : Promise.resolve(null),
-    row.sourcePhotoKey ? ctx.blobs.getUrl(row.sourcePhotoKey) : Promise.resolve(null),
+    safePhotoUrl(ctx, row.dishPhotoKey),
+    safePhotoUrl(ctx, row.scanPhotoKey),
+    safePhotoUrl(ctx, row.sourcePhotoKey),
   ]);
   return {
     id: row.id,
@@ -1452,21 +1465,22 @@ export const Actions = {
   }),
 
   seedExamples: defineAction({
-    description: "Pre-loads the two example recipes Anthony asked to ship in the box: the sausage & sauerkraut with MASHED potatoes casserole (Stockpiling Moms' Polish Sausage Casserole, the Pinterest-favourite version of Anthony's favourite dish) and the top-rated homemade lasagna from Baker by Nature (4.99/5). Each is imported live through the normal import pipeline and tagged 'example'. Idempotent: any example already in the library is skipped, and a failed import is reported, never faked.",
+    description: "Pre-loads the two example recipes Anthony asked to ship in the box: sausage and sauerkraut with MASHED potatoes — kielbasa & sauerkraut served over buttery mashed potatoes (Half-Assed Homesteading's 'Rustic Kielbasa, Apple & Sauerkraut with Mashed Potatoes', the actual dish Anthony asked for, NOT a casserole) — and the top-rated homemade lasagna from Baker by Nature (4.99/5). Each is imported live through the normal import pipeline and tagged 'example'. Idempotent: any example already in the library is skipped, and a failed import is reported, never faked. Correction built in: the earlier seeded sausage example (Stockpiling Moms' Polish Sausage Casserole — the wrong dish, rejected by Anthony on-device) is removed and replaced when it is still in its untouched seeded state (example-tagged, never cooked, never favourited).",
     request: z.object({}),
     response: z.object({
       seeded: z.array(z.string()),
       skipped: z.array(z.string()),
       failed: z.array(z.string()),
+      replaced: z.array(z.string()),
     }),
     async handler(ctx) {
       const db = ctx.db<typeof schema>();
       const examples: Array<{ label: string; url: string; titleKeyword: string; note: string }> = [
         {
           label: "Sausage & sauerkraut with mashed potatoes (example)",
-          url: "https://stockpilingmoms.com/polish-sausage-casserole/",
-          titleKeyword: "sausage casserole",
-          note: "⭐ Example recipe — sausage and sauerkraut with mashed potatoes, Anthony's favourite dish. This is Stockpiling Moms' Polish Sausage Casserole, a Pinterest favourite, imported so a full recipe is in the box from day one. Make it your own, or delete it any time.",
+          url: "https://halfassedhomesteading.com/2026/09/29/kielbasa-sauerkraut-apples/",
+          titleKeyword: "sauerkraut with mashed potatoes",
+          note: "⭐ Example recipe — sausage and sauerkraut with mashed potatoes, Anthony's favourite dish: kielbasa and sauerkraut served over buttery mashed potatoes (from the Half-Assed Homesteading blog), imported so a full recipe is in the box from day one. Make it your own, or delete it any time.",
         },
         {
           label: "Top-rated homemade lasagna (example)",
@@ -1475,13 +1489,32 @@ export const Actions = {
           note: "⭐ Example recipe — the top-rated homemade lasagna we found (rated 4.99 out of 5 from 76 reviews at Baker by Nature), imported so a full recipe is in the box from day one. Make it your own, or delete it any time.",
         },
       ];
-      const existing = await db.select({ title: schema.recipes.title }).from(schema.recipes);
+      const replaced: string[] = [];
+      // Correction: the first shipped build seeded Stockpiling Moms' "Polish
+      // Sausage Casserole" as the sausage example, but that layered casserole
+      // is not the sausage & sauerkraut with mashed potatoes dish Anthony
+      // asked for. Remove it — only while it is still exactly as seeded — so
+      // the real dish below takes its place.
+      const stale = await db
+        .select()
+        .from(schema.recipes)
+        .where(eq(schema.recipes.sourceUrl, "https://stockpilingmoms.com/polish-sausage-casserole/"));
+      for (const row of stale) {
+        if (parseJsonArray(row.tags).includes("example") && row.favorite === 0 && row.cookCount === 0) {
+          await db.delete(schema.recipes).where(eq(schema.recipes.id, row.id));
+          replaced.push(row.title);
+        }
+      }
+      const existing = await db
+        .select({ title: schema.recipes.title, sourceUrl: schema.recipes.sourceUrl })
+        .from(schema.recipes);
       const existingTitles = existing.map((r) => r.title.toLowerCase());
+      const existingUrls = existing.map((r) => r.sourceUrl ?? "");
       const seeded: string[] = [];
       const skipped: string[] = [];
       const failed: string[] = [];
       for (const ex of examples) {
-        if (existingTitles.some((t) => t.includes(ex.titleKeyword))) {
+        if (existingUrls.includes(ex.url) || existingTitles.some((t) => t.includes(ex.titleKeyword))) {
           skipped.push(ex.label);
           continue;
         }
@@ -1515,10 +1548,11 @@ export const Actions = {
           attachmentName: d.attachmentName,
         });
         existingTitles.push(d.title.toLowerCase());
+        existingUrls.push(ex.url);
         seeded.push(d.title);
       }
       ctx.invalidateQueries();
-      return { seeded, skipped, failed };
+      return { seeded, skipped, failed, replaced };
     },
   }),
 } satisfies ActionsModule;

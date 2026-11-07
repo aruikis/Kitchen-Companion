@@ -1,4 +1,4 @@
-# Kitchen Companion (UAT)
+# Kitchen Companion (UAT) — v1.1.0
 
 A recipe app built as a Muse space (TypeScript). Save recipes from a link or
 Pinterest pin, scan a cookbook page, upload a file, or type one in — every
@@ -8,11 +8,21 @@ list, easy sharing, and an optional Jewel-Osco shopping action (it hands the
 list to Jewel's own website; you sign in and pay there — no password ever
 goes into this app, and there is no Jewel API or Instacart involved).
 
-Two example recipes come in the box — a Polish sausage & sauerkraut with
-mashed potatoes casserole and a top-rated homemade lasagna. They are loaded
-by the app's own `seedExamples` action, which imports them live from their
-source pages; no database is included in this repo, so a fresh install
-starts empty apart from those examples.
+Two example recipes come in the box — sausage and sauerkraut with mashed
+potatoes (kielbasa & sauerkraut served over buttery mashed potatoes) and a
+top-rated homemade lasagna. They are loaded by the app's own `seedExamples`
+action, which imports them live from their source pages; no database is
+included in this repo, so a fresh install starts empty apart from those
+examples.
+
+## What's new in v1.1.0
+
+- Photos load properly now: one bad photo link can no longer stop the whole
+  library from loading, and a photo that fails shows a placeholder instead of
+  a broken image.
+- The sausage example is the real dish now — kielbasa and sauerkraut served
+  over mashed potatoes — replacing the Polish sausage casserole shipped by
+  mistake in the first upload.
 
 ## Installing (for your Muse)
 

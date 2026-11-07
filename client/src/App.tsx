@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { SafeAreaTopScrim, bytesToBase64 } from "@hatch/space-sdk/client";
 import { api, type ApiResponse } from "./api";
@@ -102,6 +102,10 @@ function timersInStep(step: string): FoundTimer[] {
 // Jewel-Osco's official online ordering homepage — verified by opening it
 // (page title: "Grocery Delivery Near You - Order Groceries Online | Jewel-Osco").
 const JEWEL_URL = "http://jewelosco.com/";
+
+// Visible version (Anthony's standing rule: the UAT carries its version
+// number in the app, and the GitHub push of this build is tagged with it).
+const APP_VERSION = "1.1.0";
 
 async function copyText(text: string): Promise<boolean> {
   try {
@@ -211,6 +215,38 @@ function Chip({ active, onClick, children }: { active: boolean; onClick: () => v
       {children}
     </button>
   );
+}
+
+// A stored recipe photo with a graceful fallback: if the photo link ever
+// fails to load, the placeholder takes its place instead of a broken-image
+// icon — and the rest of the page is unaffected.
+function RecipePhoto({
+  src, alt = "", imgClassName, imgStyle, placeholderClassName, placeholderText,
+}: {
+  src: string | null;
+  alt?: string;
+  imgClassName?: string;
+  imgStyle?: CSSProperties;
+  placeholderClassName?: string;
+  placeholderText?: string;
+}) {
+  const [failed, setFailed] = useState(false);
+  if (!src || failed) {
+    if (placeholderText) {
+      return (
+        <div className={placeholderClassName} style={{ background: "var(--surface2)" }}>
+          <span className="text-5xl" aria-hidden>🍽️</span>
+          <p className="mt-2 px-6 text-center text-sm" style={{ color: "var(--dim)" }}>{placeholderText}</p>
+        </div>
+      );
+    }
+    return (
+      <div className={placeholderClassName} style={{ background: "var(--surface2)" }} aria-hidden>
+        🍽️
+      </div>
+    );
+  }
+  return <img src={src} alt={alt} className={imgClassName} style={imgStyle} onError={() => setFailed(true)} />;
 }
 
 // ---------- timers ----------
@@ -487,7 +523,7 @@ function Library({
         />
       </div>
 
-      <div className="mt-3 flex gap-2 overflow-x-auto pb-1" aria-label="Filters">
+      <div className="mt-3 flex flex-wrap gap-2 pb-1" aria-label="Filters">
         <Chip active={filter === "all"} onClick={() => setFilter("all")}>All</Chip>
         <Chip active={filter === "favorites"} onClick={() => setFilter("favorites")}>♥ Favourites</Chip>
         <Chip active={filter === "want"} onClick={() => setFilter("want")}>Want to try</Chip>
@@ -556,13 +592,11 @@ function Library({
               style={{ background: "var(--surface)", border: "1px solid var(--border)" }}
             >
               <button type="button" onClick={() => onOpen(r.id)} className="block w-full text-left" aria-label={`Open ${r.title}`}>
-                {photo ? (
-                  <img src={photo} alt="" className="aspect-[4/3] w-full object-cover" />
-                ) : (
-                  <div className="flex aspect-[4/3] w-full items-center justify-center text-4xl" style={{ background: "var(--surface2)" }} aria-hidden>
-                    🍽️
-                  </div>
-                )}
+                <RecipePhoto
+                  src={photo}
+                  imgClassName="aspect-[4/3] w-full object-cover"
+                  placeholderClassName="flex aspect-[4/3] w-full items-center justify-center text-4xl"
+                />
                 <div className="p-3">
                   <h3 className="font-display text-base font-bold leading-snug">{r.title}</h3>
                   {r.tags.includes("example") && (
@@ -604,6 +638,26 @@ function Library({
       </div>
 
       {recipes.length > 0 && <BackupBar recipes={recipes} collections={collections} />}
+
+      <footer className="mt-8 pb-2 text-center">
+        <p className="text-xs" style={{ color: "var(--dim)" }}>Kitchen Companion UAT · Version {APP_VERSION}</p>
+        <details
+          className="mx-auto mt-2 max-w-md rounded-[var(--radius)] px-4 py-3 text-left"
+          style={{ background: "var(--surface)", border: "1px solid var(--border)" }}
+        >
+          <summary className="cursor-pointer text-sm font-semibold">What’s new in {APP_VERSION}</summary>
+          <ul className="mt-2 list-disc space-y-1 pl-5 text-sm" style={{ color: "var(--dim)" }}>
+            <li>
+              Photos load properly now. One bad photo link can no longer stop the whole library from
+              loading, and a photo that fails shows a placeholder instead of a broken image.
+            </li>
+            <li>
+              The sausage example is the real dish now: kielbasa and sauerkraut served over mashed
+              potatoes. The Polish sausage casserole that was shipped by mistake has been replaced.
+            </li>
+          </ul>
+        </details>
+      </footer>
     </div>
   );
 }
@@ -822,14 +876,13 @@ function RecipeDetail({
         </button>
       </div>
 
-      {heroPhoto ? (
-        <img src={heroPhoto} alt={recipe.dishPhotoUrl ? `Your photo of ${recipe.title}, cooked` : recipe.title} className="mt-3 aspect-[16/10] w-full rounded-[var(--radius)] object-cover" />
-      ) : (
-        <div className="mt-3 flex aspect-[16/10] w-full flex-col items-center justify-center rounded-[var(--radius)]" style={{ background: "var(--surface2)" }}>
-          <span className="text-5xl" aria-hidden>🍽️</span>
-          <p className="mt-2 px-6 text-center text-sm" style={{ color: "var(--dim)" }}>No photo yet — add yours when you cook it.</p>
-        </div>
-      )}
+      <RecipePhoto
+        src={heroPhoto}
+        alt={recipe.dishPhotoUrl ? `Your photo of ${recipe.title}, cooked` : recipe.title}
+        imgClassName="mt-3 aspect-[16/10] w-full rounded-[var(--radius)] object-cover"
+        placeholderClassName="mt-3 flex aspect-[16/10] w-full flex-col items-center justify-center rounded-[var(--radius)]"
+        placeholderText="No photo yet — add yours when you cook it."
+      />
       <div className="mt-2 flex items-center justify-between">
         <p className="text-xs" style={{ color: "var(--dim)" }}>
           {recipe.dishPhotoUrl ? "Your photo of the finished dish" : recipe.sourcePhotoUrl ? "Photo from the original recipe" : ""}
@@ -1142,7 +1195,13 @@ function RecipeDetail({
       {recipe.scanPhotoUrl && (
         <section className="mt-6" aria-label="Original scan">
           <h2 className="font-display text-xl font-bold">The original page</h2>
-          <img src={recipe.scanPhotoUrl} alt="The original scanned recipe page" className="mt-2 w-full rounded-[var(--radius)]" style={{ border: "1px solid var(--border)" }} />
+          <RecipePhoto
+            src={recipe.scanPhotoUrl}
+            alt="The original scanned recipe page"
+            imgClassName="mt-2 w-full rounded-[var(--radius)]"
+            imgStyle={{ border: "1px solid var(--border)" }}
+            placeholderClassName="hidden"
+          />
         </section>
       )}
       {recipe.attachmentName && (
