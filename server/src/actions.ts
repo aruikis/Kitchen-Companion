@@ -1,0 +1,1524 @@
+// Kitchen Companion actions: recipe library, collections, imports
+// (link / scan / file / pasted text — one pipeline onto a review screen),
+// meal planner, and grocery list.
+
+import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
+import { asc, desc, eq } from "drizzle-orm";
+import * as schema from "./schema";
+
+// ---------- shared shapes ----------
+
+const draftShape = {
+  title: z.string().min(1),
+  description: z.string().default(""),
+  servings: z.number().int().positive().nullable().default(null),
+  prepMinutes: z.number().int().nonnegative().nullable().default(null),
+  cookMinutes: z.number().int().nonnegative().nullable().default(null),
+  ingredients: z.array(z.string()).default([]),
+  steps: z.array(z.string()).default([]),
+  tags: z.array(z.string()).default([]),
+  sourceUrl: z.string().nullable().default(null),
+  sourceName: z.string().nullable().default(null),
+  collectionId: z.number().int().nullable().default(null),
+  notes: z.string().default(""),
+  dishPhotoKey: z.string().nullable().default(null),
+  scanPhotoKey: z.string().nullable().default(null),
+  sourcePhotoKey: z.string().nullable().default(null),
+  attachmentName: z.string().nullable().default(null),
+};
+
+const recipeDto = z.object({
+  id: z.number(),
+  title: z.string(),
+  description: z.string(),
+  servings: z.number().nullable(),
+  prepMinutes: z.number().nullable(),
+  cookMinutes: z.number().nullable(),
+  ingredients: z.array(z.string()),
+  steps: z.array(z.string()),
+  tags: z.array(z.string()),
+  sourceUrl: z.string().nullable(),
+  sourceName: z.string().nullable(),
+  collectionId: z.number().nullable(),
+  favorite: z.boolean(),
+  rating: z.number().nullable(),
+  status: z.enum(["want", "made"]),
+  cookCount: z.number(),
+  lastCookedAt: z.string().nullable(),
+  notes: z.string(),
+  dishPhotoKey: z.string().nullable(),
+  scanPhotoKey: z.string().nullable(),
+  sourcePhotoKey: z.string().nullable(),
+  dishPhotoUrl: z.string().nullable(),
+  scanPhotoUrl: z.string().nullable(),
+  sourcePhotoUrl: z.string().nullable(),
+  attachmentName: z.string().nullable(),
+  createdAt: z.string(),
+});
+
+type RecipeRow = typeof schema.recipes.$inferSelect;
+
+function parseJsonArray(raw: string): string[] {
+  try {
+    const v: unknown = JSON.parse(raw);
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+async function toDto(ctx: Ctx, row: RecipeRow): Promise<z.infer<typeof recipeDto>> {
+  const [dishPhotoUrl, scanPhotoUrl, sourcePhotoUrl] = await Promise.all([
+    row.dishPhotoKey ? ctx.blobs.getUrl(row.dishPhotoKey) : Promise.resolve(null),
+    row.scanPhotoKey ? ctx.blobs.getUrl(row.scanPhotoKey) : Promise.resolve(null),
+    row.sourcePhotoKey ? ctx.blobs.getUrl(row.sourcePhotoKey) : Promise.resolve(null),
+  ]);
+  return {
+    id: row.id,
+    title: row.title,
+    description: row.description,
+    servings: row.servings,
+    prepMinutes: row.prepMinutes,
+    cookMinutes: row.cookMinutes,
+    ingredients: parseJsonArray(row.ingredients),
+    steps: parseJsonArray(row.steps),
+    tags: parseJsonArray(row.tags),
+    sourceUrl: row.sourceUrl,
+    sourceName: row.sourceName,
+    collectionId: row.collectionId,
+    favorite: row.favorite === 1,
+    rating: row.rating,
+    status: row.status,
+    cookCount: row.cookCount,
+    lastCookedAt: row.lastCookedAt,
+    notes: row.notes,
+    dishPhotoKey: row.dishPhotoKey,
+    scanPhotoKey: row.scanPhotoKey,
+    sourcePhotoKey: row.sourcePhotoKey,
+    dishPhotoUrl,
+    scanPhotoUrl,
+    sourcePhotoUrl,
+    attachmentName: row.attachmentName,
+    createdAt: row.createdAt.toISOString(),
+  };
+}
+
+function todayInChicago(): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Chicago",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
+// ---------- import helpers ----------
+
+const UA =
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
+
+async function fetchText(url: string): Promise<{ ok: boolean; text: string; finalUrl: string }> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": UA, Accept: "text/html,application/xhtml+xml" },
+      redirect: "follow",
+      signal: ctrl.signal,
+    });
+    const text = await res.text();
+    return { ok: res.ok, text, finalUrl: res.url || url };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function parseDurationMinutes(iso: unknown): number | null {
+  if (typeof iso !== "string") return null;
+  const m = iso.match(/^P(?:(\d+(?:\.\d+)?)D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$/);
+  if (!m) return null;
+  const days = parseFloat(m[1] ?? "0");
+  const hours = parseFloat(m[2] ?? "0");
+  const mins = parseFloat(m[3] ?? "0");
+  const secs = parseFloat(m[4] ?? "0");
+  const total = days * 1440 + hours * 60 + mins + secs / 60;
+  return total > 0 ? Math.round(total) : null;
+}
+
+function asString(v: unknown): string {
+  return typeof v === "string" ? v.trim() : "";
+}
+
+function flattenInstructions(v: unknown): string[] {
+  if (typeof v === "string") {
+    return v.split(/\r?\n+/).map((s) => s.trim()).filter(Boolean);
+  }
+  if (Array.isArray(v)) {
+    const out: string[] = [];
+    for (const item of v) {
+      out.push(...flattenInstructions(item));
+    }
+    return out;
+  }
+  if (v && typeof v === "object") {
+    const obj = v as Record<string, unknown>;
+    if (typeof obj.text === "string") return [obj.text.trim()];
+    if ("itemListElement" in obj) return flattenInstructions(obj.itemListElement);
+  }
+  return [];
+}
+
+function findRecipeNode(node: unknown, depth: number): Record<string, unknown> | null {
+  if (depth > 6 || node === null || typeof node !== "object") return null;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = findRecipeNode(item, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+  const obj = node as Record<string, unknown>;
+  const type = obj["@type"];
+  const types = Array.isArray(type) ? type : [type];
+  if (types.some((t) => typeof t === "string" && t.toLowerCase() === "recipe")) return obj;
+  for (const key of ["@graph", "mainEntity", "itemListElement"]) {
+    if (key in obj) {
+      const found = findRecipeNode(obj[key], depth + 1);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+function recipeFromJsonLd(html: string): Record<string, unknown> | null {
+  const blocks = html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi);
+  for (const block of blocks) {
+    const raw = block[1];
+    if (!raw) continue;
+    try {
+      const parsed: unknown = JSON.parse(raw.trim());
+      const found = findRecipeNode(parsed, 0);
+      if (found) return found;
+    } catch {
+      // not valid JSON — keep looking
+    }
+  }
+  return null;
+}
+
+function imageUrlFrom(node: Record<string, unknown>): string | null {
+  const img = node.image;
+  if (typeof img === "string" && img.startsWith("http")) return img;
+  if (Array.isArray(img)) {
+    for (const item of img) {
+      const u = imageUrlFrom({ image: item });
+      if (u) return u;
+    }
+    return null;
+  }
+  if (img && typeof img === "object") {
+    const url = (img as Record<string, unknown>).url;
+    if (typeof url === "string" && url.startsWith("http")) return url;
+  }
+  return null;
+}
+
+function servingsFrom(node: Record<string, unknown>): number | null {
+  const y = node.recipeYield;
+  const first = Array.isArray(y) ? y[0] : y;
+  if (typeof first === "number" && first > 0) return Math.round(first);
+  if (typeof first === "string") {
+    const m = first.match(/\d+(?:\.\d+)?/);
+    if (m) {
+      const n = parseFloat(m[0]);
+      if (n > 0) return Math.round(n);
+    }
+  }
+  return null;
+}
+
+function stripHtmlToText(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;|&apos;/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const inferenceDraftSchema = z.object({
+  title: z.string(),
+  description: z.string(),
+  servings: z.number().nullable(),
+  prepMinutes: z.number().nullable(),
+  cookMinutes: z.number().nullable(),
+  ingredients: z.array(z.string()),
+  steps: z.array(z.string()),
+  tags: z.array(z.string()),
+});
+
+type InferenceDraft = z.infer<typeof inferenceDraftSchema>;
+
+function cleanDraft(d: InferenceDraft) {
+  return {
+    title: d.title.trim() || "Untitled recipe",
+    description: d.description.trim(),
+    servings: d.servings != null && d.servings > 0 ? Math.round(d.servings) : null,
+    prepMinutes: d.prepMinutes != null && d.prepMinutes >= 0 ? Math.round(d.prepMinutes) : null,
+    cookMinutes: d.cookMinutes != null && d.cookMinutes >= 0 ? Math.round(d.cookMinutes) : null,
+    ingredients: d.ingredients.map((s) => s.trim()).filter(Boolean),
+    steps: d.steps.map((s) => s.trim()).filter(Boolean),
+    tags: d.tags.map((s) => s.trim().toLowerCase()).filter(Boolean).slice(0, 8),
+  };
+}
+
+async function downloadImageToBlob(ctx: Ctx, url: string): Promise<string | null> {
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 12000);
+    try {
+      const res = await fetch(url, { headers: { "User-Agent": UA }, signal: ctrl.signal });
+      if (!res.ok) return null;
+      const ct = res.headers.get("content-type") ?? "";
+      if (!ct.startsWith("image/")) return null;
+      const buf = new Uint8Array(await res.arrayBuffer());
+      if (buf.length === 0 || buf.length > 6_000_000) return null;
+      const key = `src/${crypto.randomUUID()}`;
+      await ctx.blobs.put(key, buf, { contentType: ct.split(";")[0] ?? "image/jpeg" });
+      return key;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return null;
+  }
+}
+
+// ---------- grocery helpers ----------
+
+const UNICODE_FRAC: Record<string, number> = {
+  "½": 0.5, "¼": 0.25, "¾": 0.75, "⅓": 1 / 3, "⅔": 2 / 3,
+  "⅛": 0.125, "⅜": 0.375, "⅝": 0.625, "⅞": 0.875,
+};
+
+const UNITS = [
+  "tablespoons", "tablespoon", "tbsp", "teaspoons", "teaspoon", "tsp",
+  "cups", "cup", "ounces", "ounce", "oz", "pounds", "pound", "lbs", "lb",
+  "grams", "gram", "g", "kg", "ml", "liters", "liter", "l",
+  "cans", "can", "cloves", "clove", "bunches", "bunch", "pinches", "pinch",
+  "packages", "package", "pkg", "boxes", "box", "bags", "bag", "heads", "head",
+  "stalks", "stalk", "slices", "slice", "pieces", "piece",
+];
+
+function parseIngredient(line: string): { qty: number | null; unit: string; name: string } {
+  let rest = line.trim();
+  let qty: number | null = null;
+  const mixed = rest.match(/^(\d+)\s+(\d+)\s*\/\s*(\d+)\s*/);
+  const frac = rest.match(/^(\d+)\s*\/\s*(\d+)\s*/);
+  const plain = rest.match(/^(\d+(?:\.\d+)?)\s*/);
+  const uni = rest.match(/^(\d+)?\s*([½¼¾⅓⅔⅛⅜⅝⅞])\s*/);
+  if (mixed && mixed[1] && mixed[2] && mixed[3]) {
+    qty = parseInt(mixed[1], 10) + parseInt(mixed[2], 10) / parseInt(mixed[3], 10);
+    rest = rest.slice(mixed[0].length);
+  } else if (frac && frac[1] && frac[2]) {
+    qty = parseInt(frac[1], 10) / parseInt(frac[2], 10);
+    rest = rest.slice(frac[0].length);
+  } else if (uni && uni[2] && UNICODE_FRAC[uni[2]] != null) {
+    qty = (uni[1] ? parseInt(uni[1], 10) : 0) + (UNICODE_FRAC[uni[2]] ?? 0);
+    rest = rest.slice(uni[0].length);
+  } else if (plain && plain[1]) {
+    qty = parseFloat(plain[1]);
+    rest = rest.slice(plain[0].length);
+  }
+  let unit = "";
+  const lower = rest.toLowerCase();
+  for (const u of UNITS) {
+    if (lower === u || lower.startsWith(u + " ") || lower.startsWith(u + "s ")) {
+      unit = u;
+      rest = rest.slice(u.length).trim();
+      break;
+    }
+  }
+  rest = rest.replace(/^of\s+/i, "").trim();
+  // Drop trailing prep notes after a comma for the list name, keep them out.
+  const name = (rest.split(",")[0] ?? rest).trim() || line.trim();
+  return { qty, unit, name };
+}
+
+function fmtQty(n: number): string {
+  const rounded = Math.round(n * 8) / 8;
+  const whole = Math.floor(rounded);
+  const rem = rounded - whole;
+  const fracs: Array<[number, string]> = [
+    [0.125, "1/8"], [0.25, "1/4"], [1 / 3, "1/3"], [0.375, "3/8"],
+    [0.5, "1/2"], [0.625, "5/8"], [2 / 3, "2/3"], [0.75, "3/4"], [0.875, "7/8"],
+  ];
+  let fracStr = "";
+  for (const [v, s] of fracs) {
+    if (Math.abs(rem - v) < 0.04) { fracStr = s; break; }
+  }
+  if (rem !== 0 && !fracStr) return String(Math.round(n * 100) / 100);
+  if (whole === 0) return fracStr || "0";
+  return fracStr ? `${whole} ${fracStr}` : String(whole);
+}
+
+const AISLES: Array<{ aisle: string; words: string[] }> = [
+  { aisle: "Produce", words: ["tomato", "onion", "garlic", "lemon", "lime", "spinach", "lettuce", "potato", "carrot", "pepper", "cucumber", "avocado", "apple", "banana", "herb", "parsley", "cilantro", "basil", "ginger", "mushroom", "zucchini", "broccoli", "cauliflower", "celery", "corn", "bean sprout", "scallion", "green onion", "jalape", "berries", "berry", "orange", "peach", "melon", "cabbage", "kale", "chard", "leek", "shallot", "squash", "eggplant", "asparagus", "artichoke"] },
+  { aisle: "Meat & seafood", words: ["chicken", "beef", "pork", "salmon", "shrimp", "bacon", "sausage", "turkey", "lamb", "fish", "tilapia", "cod", "tuna steak", "ground", "steak", "ham", "prosciutto", "salami", "crab", "scallop"] },
+  { aisle: "Dairy & eggs", words: ["milk", "cheese", "butter", "egg", "cream", "yogurt", "sour cream", "mozzarella", "parmesan", "cheddar", "ricotta", "cottage", "half and half", "whipping"] },
+  { aisle: "Bakery & bread", words: ["bread", "tortilla", "bun", "roll", "baguette", "pita", "naan", "croissant", "muffin", "pie crust", "pizza dough"] },
+  { aisle: "Frozen", words: ["frozen", "ice cream", "peas (frozen"] },
+  { aisle: "Spices & baking", words: ["flour", "sugar", "baking powder", "baking soda", "cinnamon", "cumin", "paprika", "oregano", "thyme", "rosemary", "nutmeg", "vanilla", "cocoa", "chili powder", "curry", "salt", "black pepper", "yeast", "cornstarch", "brown sugar", "powdered sugar", "spice"] },
+  { aisle: "Pantry", words: ["rice", "pasta", "spaghetti", "noodle", "oil", "vinegar", "sauce", "broth", "stock", "can", "beans", "lentil", "quinoa", "oat", "peanut butter", "honey", "maple", "soy sauce", "ketchup", "mustard", "mayonnaise", "salsa", "coconut milk", "breadcrumb", "cracker", "cereal"] },
+];
+
+function guessAisle(name: string): string {
+  const lower = name.toLowerCase();
+  for (const { aisle, words } of AISLES) {
+    if (words.some((w) => lower.includes(w))) return aisle;
+  }
+  return "Other";
+}
+
+// ---------- Jewel-Osco helpers (hoisted; used by the shop actions above) ----------
+
+// Jewel-Osco's official online ordering homepage — verified by opening it
+// (page title: "Grocery Delivery Near You - Order Groceries Online | Jewel-Osco").
+const JEWEL_URL = "http://jewelosco.com/";
+
+const jewelOrderDto = z.object({
+  id: z.number(),
+  storeName: z.string(),
+  storeLocation: z.string(),
+  items: z.array(z.object({ name: z.string(), detail: z.string() })),
+  itemCount: z.number(),
+  status: z.enum(["built", "sent"]),
+  cartText: z.string(),
+  createdAt: z.string(),
+});
+
+type JewelOrderRow = typeof schema.jewelOrders.$inferSelect;
+
+function parseCartItems(raw: string): Array<{ name: string; detail: string }> {
+  try {
+    const v: unknown = JSON.parse(raw);
+    if (!Array.isArray(v)) return [];
+    return v.flatMap((x) => {
+      if (x && typeof x === "object") {
+        const o = x as Record<string, unknown>;
+        if (typeof o.name === "string" && o.name.trim()) {
+          return [{ name: o.name, detail: typeof o.detail === "string" ? o.detail : "" }];
+        }
+      }
+      return [];
+    });
+  } catch {
+    return [];
+  }
+}
+
+function parseJsonIds(raw: string): number[] {
+  try {
+    const v: unknown = JSON.parse(raw);
+    return Array.isArray(v) ? v.filter((x): x is number => typeof x === "number") : [];
+  } catch {
+    return [];
+  }
+}
+
+function jewelCartText(storeName: string, storeLocation: string, items: Array<{ name: string; detail: string }>): string {
+  const lines: string[] = [`${storeName} shopping list — from Kitchen Companion`];
+  if (storeLocation) lines.push(`Store: ${storeLocation}`);
+  lines.push("");
+  for (const i of items) lines.push(`- ${i.detail ? `${i.detail} ` : ""}${i.name}`);
+  return lines.join("\n");
+}
+
+function orderToDto(row: JewelOrderRow): z.infer<typeof jewelOrderDto> {
+  const items = parseCartItems(row.items);
+  return {
+    id: row.id,
+    storeName: row.storeName,
+    storeLocation: row.storeLocation,
+    items,
+    itemCount: items.length,
+    status: row.status,
+    cartText: jewelCartText(row.storeName, row.storeLocation, items),
+    createdAt: row.createdAt.toISOString(),
+  };
+}
+
+async function getSetting(ctx: Ctx, key: string, fallback: string): Promise<string> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db.select().from(schema.appSettings).where(eq(schema.appSettings.key, key));
+  const value = rows[0]?.value.trim();
+  return value ? value : fallback;
+}
+
+// Some source pages pack every step into one string with the numbering
+// embedded ("...undrained2. After washing..."). For the seeded examples,
+// split those back into individual steps and drop the printed numbers —
+// the app numbers steps itself.
+function splitSeedSteps(steps: string[]): string[] {
+  const out: string[] = [];
+  for (const s of steps) {
+    const parts = s
+      .split(/(?<=[^\s])\s*(?=\d{1,2}\.\s)/)
+      .map((p) => p.replace(/^\d+\s*[.)]\s*/, "").trim())
+      .filter(Boolean);
+    out.push(...(parts.length > 0 ? parts : [s.trim()]));
+  }
+  // Drop fragments with no letters at all (leftover digits from the split).
+  return out.filter((p) => /[a-zA-Z]/.test(p));
+}
+
+// Runs the whole link-import pipeline (JSON-LD, Pinterest pin following,
+// inference fallback) and returns a draft for review. Shared by the
+// importUrl action and the seedExamples action.
+async function draftFromUrl(ctx: Ctx, url: string): Promise<DraftResponse> {
+  let page: { ok: boolean; text: string; finalUrl: string };
+  try {
+    page = await fetchText(url);
+  } catch {
+    return emptyDraftError("That page could not be reached. Check the link, or paste the recipe text instead.");
+  }
+  if (!page.ok && page.text.length < 500) {
+    return emptyDraftError("That page would not open. Try pasting the recipe text instead.");
+  }
+  let node = recipeFromJsonLd(page.text);
+  let sourceUrl = page.finalUrl;
+
+  // Pinterest pins rarely carry the recipe themselves — follow out to the source blog.
+  if (!node && /pinterest\./i.test(sourceUrl)) {
+    const candidates = new Set<string>();
+    for (const m of page.text.matchAll(/https?:\/\/[^\s"'\\<>]+/g)) {
+      const u = m[0].replace(/\\u002F/g, "/").replace(/&amp;/g, "&");
+      try {
+        const host = new URL(u).hostname;
+        if (!/pinterest|pinimg|google|facebook|instagram|gstatic/i.test(host)) candidates.add(u);
+      } catch { /* ignore malformed */ }
+      if (candidates.size >= 12) break;
+    }
+    for (const candidate of candidates) {
+      try {
+        const sub = await fetchText(candidate);
+        if (!sub.ok) continue;
+        const subNode = recipeFromJsonLd(sub.text);
+        if (subNode) {
+          node = subNode;
+          sourceUrl = sub.finalUrl;
+          page = sub;
+          break;
+        }
+      } catch { /* try next candidate */ }
+    }
+  }
+
+  if (node) {
+    const ingredients = Array.isArray(node.recipeIngredient)
+      ? node.recipeIngredient.filter((x): x is string => typeof x === "string").map((s) => s.trim()).filter(Boolean)
+      : [];
+    const steps = flattenInstructions(node.recipeInstructions);
+    let prep = parseDurationMinutes(node.prepTime);
+    let cook = parseDurationMinutes(node.cookTime);
+    if (prep == null && cook == null) {
+      const total = parseDurationMinutes(node.totalTime);
+      if (total != null) cook = total;
+    }
+    const imgUrl = imageUrlFrom(node);
+    const sourcePhotoKey = imgUrl ? await downloadImageToBlob(ctx, imgUrl) : null;
+    let host = "";
+    try { host = new URL(sourceUrl).hostname.replace(/^www\./, ""); } catch { host = ""; }
+    const rawTags: string[] = [];
+    if (typeof node.recipeCategory === "string") rawTags.push(node.recipeCategory);
+    if (Array.isArray(node.recipeCategory)) rawTags.push(...node.recipeCategory.filter((x): x is string => typeof x === "string"));
+    if (typeof node.recipeCuisine === "string") rawTags.push(node.recipeCuisine);
+    return {
+      ok: true,
+      error: null,
+      draft: {
+        title: asString(node.name) || "Untitled recipe",
+        description: asString(node.description),
+        servings: servingsFrom(node),
+        prepMinutes: prep,
+        cookMinutes: cook,
+        ingredients,
+        steps,
+        tags: rawTags.map((t) => t.trim().toLowerCase()).filter(Boolean).slice(0, 8),
+        sourceUrl,
+        sourceName: host || null,
+        sourcePhotoKey,
+        scanPhotoKey: null,
+        attachmentName: null,
+      },
+    };
+  }
+
+  // No structured recipe on the page — let the model read the visible text.
+  const text = stripHtmlToText(page.text).slice(0, 7000);
+  if (text.length < 80) {
+    return emptyDraftError("No recipe could be found on that page. If it is a photo-only pin, try the scanner or paste the recipe text.");
+  }
+  try {
+    const structured = await ctx.inference.complete(
+      "Read this web page text and extract the recipe it contains. Ignore navigation, ads, comments, and the author's personal story — keep only the recipe itself.",
+      { schema: inferenceDraftSchema, system: "You extract recipes from noisy web pages into clean structured data. Page text:\n\n" + text },
+    );
+    const cleaned = cleanDraft(structured);
+    if (cleaned.ingredients.length === 0 && cleaned.steps.length === 0) {
+      return emptyDraftError("No recipe could be found on that page. Try pasting the recipe text instead.");
+    }
+    let host = "";
+    try { host = new URL(sourceUrl).hostname.replace(/^www\./, ""); } catch { host = ""; }
+    return {
+      ok: true,
+      error: null,
+      draft: {
+        ...cleaned,
+        sourceUrl,
+        sourceName: host || null,
+        sourcePhotoKey: null,
+        scanPhotoKey: null,
+        attachmentName: null,
+      },
+    };
+  } catch {
+    return emptyDraftError("The recipe on that page could not be read automatically. Try pasting the recipe text instead.");
+  }
+}
+
+// ---------- actions ----------
+
+const draftResponse = z.object({
+  ok: z.boolean(),
+  error: z.string().nullable(),
+  draft: z.object({
+    title: z.string(),
+    description: z.string(),
+    servings: z.number().nullable(),
+    prepMinutes: z.number().nullable(),
+    cookMinutes: z.number().nullable(),
+    ingredients: z.array(z.string()),
+    steps: z.array(z.string()),
+    tags: z.array(z.string()),
+    sourceUrl: z.string().nullable(),
+    sourceName: z.string().nullable(),
+    sourcePhotoKey: z.string().nullable(),
+    scanPhotoKey: z.string().nullable(),
+    attachmentName: z.string().nullable(),
+  }).nullable(),
+});
+type DraftResponse = z.infer<typeof draftResponse>;
+
+function emptyDraftError(error: string): DraftResponse {
+  return { ok: false, error, draft: null };
+}
+
+export const Actions = {
+  listRecipes: defineAction({
+    description: "Lists every recipe in the library, newest first, with photo URLs resolved.",
+    request: z.object({}),
+    response: z.object({ recipes: z.array(recipeDto) }),
+    async handler(ctx) {
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.recipes).orderBy(desc(schema.recipes.id));
+      const recipes = await Promise.all(rows.map((r) => toDto(ctx, r)));
+      return { recipes };
+    },
+  }),
+
+  createRecipe: defineAction({
+    description: "Saves a new recipe from a reviewed draft.",
+    request: z.object(draftShape),
+    response: z.object({ id: z.number() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const inserted = await db.insert(schema.recipes).values({
+        title: args.title.trim(),
+        description: args.description,
+        servings: args.servings,
+        prepMinutes: args.prepMinutes,
+        cookMinutes: args.cookMinutes,
+        ingredients: JSON.stringify(args.ingredients.map((s) => s.trim()).filter(Boolean)),
+        steps: JSON.stringify(args.steps.map((s) => s.trim()).filter(Boolean)),
+        tags: JSON.stringify(args.tags.map((s) => s.trim().toLowerCase()).filter(Boolean)),
+        sourceUrl: args.sourceUrl,
+        sourceName: args.sourceName,
+        collectionId: args.collectionId,
+        notes: args.notes,
+        dishPhotoKey: args.dishPhotoKey,
+        scanPhotoKey: args.scanPhotoKey,
+        sourcePhotoKey: args.sourcePhotoKey,
+        attachmentName: args.attachmentName,
+      }).returning({ id: schema.recipes.id });
+      const row = inserted[0];
+      if (!row) throw new Error("createRecipe: no row returned");
+      ctx.invalidateQueries();
+      return { id: row.id };
+    },
+  }),
+
+  updateRecipe: defineAction({
+    description: "Replaces a recipe's editable fields with a reviewed draft.",
+    request: z.object({ id: z.number().int(), ...draftShape }),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx, args): Promise<{ ok: true }> {
+      const db = ctx.db<typeof schema>();
+      await db.update(schema.recipes).set({
+        title: args.title.trim(),
+        description: args.description,
+        servings: args.servings,
+        prepMinutes: args.prepMinutes,
+        cookMinutes: args.cookMinutes,
+        ingredients: JSON.stringify(args.ingredients.map((s) => s.trim()).filter(Boolean)),
+        steps: JSON.stringify(args.steps.map((s) => s.trim()).filter(Boolean)),
+        tags: JSON.stringify(args.tags.map((s) => s.trim().toLowerCase()).filter(Boolean)),
+        sourceUrl: args.sourceUrl,
+        sourceName: args.sourceName,
+        collectionId: args.collectionId,
+        notes: args.notes,
+        dishPhotoKey: args.dishPhotoKey,
+        scanPhotoKey: args.scanPhotoKey,
+        sourcePhotoKey: args.sourcePhotoKey,
+        attachmentName: args.attachmentName,
+        updatedAt: new Date(),
+      }).where(eq(schema.recipes.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  deleteRecipe: defineAction({
+    description: "Deletes a recipe and any meal-plan entries pointing at it.",
+    request: z.object({ id: z.number().int() }),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx, args): Promise<{ ok: true }> {
+      const db = ctx.db<typeof schema>();
+      await db.delete(schema.mealPlan).where(eq(schema.mealPlan.recipeId, args.id));
+      await db.delete(schema.recipes).where(eq(schema.recipes.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  setFavorite: defineAction({
+    description: "Marks or unmarks a recipe as a favourite.",
+    request: z.object({ id: z.number().int(), favorite: z.boolean() }),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx, args): Promise<{ ok: true }> {
+      const db = ctx.db<typeof schema>();
+      await db.update(schema.recipes)
+        .set({ favorite: args.favorite ? 1 : 0, updatedAt: new Date() })
+        .where(eq(schema.recipes.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  setRating: defineAction({
+    description: "Sets a recipe's star rating (1-5) or clears it.",
+    request: z.object({ id: z.number().int(), rating: z.number().int().min(1).max(5).nullable() }),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx, args): Promise<{ ok: true }> {
+      const db = ctx.db<typeof schema>();
+      await db.update(schema.recipes)
+        .set({ rating: args.rating, updatedAt: new Date() })
+        .where(eq(schema.recipes.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  markCooked: defineAction({
+    description: "Records that a recipe was cooked today: bumps the cook count, sets the last-cooked date, and moves it to Made It.",
+    request: z.object({ id: z.number().int() }),
+    response: z.object({ ok: z.literal(true), lastCookedAt: z.string() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.recipes).where(eq(schema.recipes.id, args.id));
+      const row = rows[0];
+      if (!row) throw new Error("markCooked: recipe not found");
+      const today = todayInChicago();
+      await db.update(schema.recipes).set({
+        cookCount: row.cookCount + 1,
+        lastCookedAt: today,
+        status: "made",
+        updatedAt: new Date(),
+      }).where(eq(schema.recipes.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true as const, lastCookedAt: today };
+    },
+  }),
+
+  listCollections: defineAction({
+    description: "Lists recipe collections in creation order.",
+    request: z.object({}),
+    response: z.object({
+      collections: z.array(z.object({ id: z.number(), name: z.string() })),
+    }),
+    async handler(ctx) {
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.collections).orderBy(asc(schema.collections.id));
+      return { collections: rows.map((r) => ({ id: r.id, name: r.name })) };
+    },
+  }),
+
+  createCollection: defineAction({
+    description: "Creates a new recipe collection (folder).",
+    request: z.object({ name: z.string().min(1) }),
+    response: z.object({ id: z.number() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const inserted = await db.insert(schema.collections)
+        .values({ name: args.name.trim() })
+        .returning({ id: schema.collections.id });
+      const row = inserted[0];
+      if (!row) throw new Error("createCollection: no row returned");
+      ctx.invalidateQueries();
+      return { id: row.id };
+    },
+  }),
+
+  deleteCollection: defineAction({
+    description: "Deletes a collection; its recipes stay in the library, unfiled.",
+    request: z.object({ id: z.number().int() }),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx, args): Promise<{ ok: true }> {
+      const db = ctx.db<typeof schema>();
+      await db.update(schema.recipes)
+        .set({ collectionId: null })
+        .where(eq(schema.recipes.collectionId, args.id));
+      await db.delete(schema.collections).where(eq(schema.collections.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  storePhoto: defineAction({
+    description: "Stores an uploaded photo (finished dish or scan original) and returns its blob key.",
+    request: z.object({
+      dataBase64: z.string().min(1),
+      mimeType: z.string().min(1),
+      kind: z.enum(["dish", "scan"]),
+    }),
+    response: z.object({ key: z.string(), url: z.string() }),
+    async handler(ctx, args) {
+      const bytes = Uint8Array.from(atob(args.dataBase64), (c) => c.charCodeAt(0));
+      const key = `${args.kind}/${crypto.randomUUID()}`;
+      await ctx.blobs.put(key, bytes, { contentType: args.mimeType });
+      const url = await ctx.blobs.getUrl(key);
+      return { key, url };
+    },
+  }),
+
+  storeAttachment: defineAction({
+    description: "Stores an uploaded file (for example a PDF) as a recipe's attached original and returns its blob key.",
+    request: z.object({
+      dataBase64: z.string().min(1),
+      mimeType: z.string().min(1),
+      filename: z.string().min(1),
+    }),
+    response: z.object({ key: z.string() }),
+    async handler(ctx, args) {
+      const bytes = Uint8Array.from(atob(args.dataBase64), (c) => c.charCodeAt(0));
+      if (bytes.length > 10_000_000) throw new Error("File is too large (10 MB limit).");
+      const key = `file/${crypto.randomUUID()}`;
+      await ctx.blobs.put(key, bytes, { contentType: args.mimeType });
+      return { key };
+    },
+  }),
+
+  importUrl: defineAction({
+    description: "Fetches a recipe page (or a Pinterest pin's source page) the user pasted and extracts a structured draft for review. Nothing is saved until the user confirms on the review screen.",
+    request: z.object({ url: z.string().url() }),
+    response: draftResponse,
+    async handler(ctx, args): Promise<DraftResponse> {
+      return draftFromUrl(ctx, args.url);
+    },
+  }),
+
+  structureText: defineAction({
+    description: "Turns pasted recipe text (or the text of an uploaded text file) into a structured draft for review.",
+    request: z.object({ text: z.string().min(10).max(20000) }),
+    response: draftResponse,
+    async handler(ctx, args): Promise<DraftResponse> {
+      try {
+        const structured = await ctx.inference.complete(
+          "Turn this text into a clean structured recipe. Keep the cook's own quantities and wording; split ingredients and steps into separate entries.",
+          { schema: inferenceDraftSchema, system: "Recipe text:\n\n" + args.text },
+        );
+        const cleaned = cleanDraft(structured);
+        return {
+          ok: true,
+          error: null,
+          draft: {
+            ...cleaned,
+            sourceUrl: null,
+            sourceName: null,
+            sourcePhotoKey: null,
+            scanPhotoKey: null,
+            attachmentName: null,
+          },
+        };
+      } catch {
+        return emptyDraftError("That text could not be turned into a recipe automatically. You can still type the recipe in by hand.");
+      }
+    },
+  }),
+
+  scanImage: defineAction({
+    description: "Reads a photo of a recipe page or card with vision OCR and returns a structured draft for review; the photo itself is stored as the recipe's original.",
+    request: z.object({
+      dataBase64: z.string().min(1),
+      mimeType: z.enum(["image/jpeg", "image/png"]),
+    }),
+    response: draftResponse,
+    async handler(ctx, args): Promise<DraftResponse> {
+      const bytes = Uint8Array.from(atob(args.dataBase64), (c) => c.charCodeAt(0));
+      const key = `scan/${crypto.randomUUID()}`;
+      await ctx.blobs.put(key, bytes, { contentType: args.mimeType });
+      try {
+        const structured = await ctx.inference.complete(
+          "Read the recipe in this photo and return it structured. Transcribe quantities and steps exactly as written; if handwriting is unclear, make your best reading — the cook will check and fix it on the next screen.",
+          {
+            schema: inferenceDraftSchema,
+            images: [{ dataBase64: args.dataBase64, mimeType: args.mimeType, caption: "Photo of a recipe page or card" }],
+          },
+        );
+        const cleaned = cleanDraft(structured);
+        return {
+          ok: true,
+          error: null,
+          draft: {
+            ...cleaned,
+            sourceUrl: null,
+            sourceName: "Scanned page",
+            sourcePhotoKey: null,
+            scanPhotoKey: key,
+            attachmentName: null,
+          },
+        };
+      } catch {
+        return {
+          ok: false,
+          error: "The photo could not be read automatically. It has been kept — you can type the recipe in by hand on the review screen.",
+          draft: {
+            title: "Untitled recipe",
+            description: "",
+            servings: null,
+            prepMinutes: null,
+            cookMinutes: null,
+            ingredients: [],
+            steps: [],
+            tags: [],
+            sourceUrl: null,
+            sourceName: "Scanned page",
+            sourcePhotoKey: null,
+            scanPhotoKey: key,
+            attachmentName: null,
+          },
+        };
+      }
+    },
+  }),
+
+  listPlan: defineAction({
+    description: "Lists meal-plan entries between two dates (inclusive, YYYY-MM-DD).",
+    request: z.object({ from: z.string(), to: z.string() }),
+    response: z.object({
+      entries: z.array(z.object({
+        id: z.number(),
+        date: z.string(),
+        meal: z.enum(["breakfast", "lunch", "dinner", "other"]),
+        recipeId: z.number().nullable(),
+        label: z.string().nullable(),
+        recipeTitle: z.string().nullable(),
+      })),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.mealPlan).orderBy(asc(schema.mealPlan.date), asc(schema.mealPlan.id));
+      const filtered = rows.filter((r) => r.date >= args.from && r.date <= args.to);
+      const recipeRows = await db.select({ id: schema.recipes.id, title: schema.recipes.title }).from(schema.recipes);
+      const titles = new Map(recipeRows.map((r) => [r.id, r.title]));
+      return {
+        entries: filtered.map((r) => ({
+          id: r.id,
+          date: r.date,
+          meal: r.meal,
+          recipeId: r.recipeId,
+          label: r.label,
+          recipeTitle: r.recipeId != null ? (titles.get(r.recipeId) ?? null) : null,
+        })),
+      };
+    },
+  }),
+
+  addPlanEntry: defineAction({
+    description: "Adds a recipe (or a free-text note like 'leftovers') to a day on the meal planner.",
+    request: z.object({
+      date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+      meal: z.enum(["breakfast", "lunch", "dinner", "other"]),
+      recipeId: z.number().int().nullable().default(null),
+      label: z.string().nullable().default(null),
+    }),
+    response: z.object({ id: z.number() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const inserted = await db.insert(schema.mealPlan).values({
+        date: args.date,
+        meal: args.meal,
+        recipeId: args.recipeId,
+        label: args.label,
+      }).returning({ id: schema.mealPlan.id });
+      const row = inserted[0];
+      if (!row) throw new Error("addPlanEntry: no row returned");
+      ctx.invalidateQueries();
+      return { id: row.id };
+    },
+  }),
+
+  removePlanEntry: defineAction({
+    description: "Removes one entry from the meal planner.",
+    request: z.object({ id: z.number().int() }),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx, args): Promise<{ ok: true }> {
+      const db = ctx.db<typeof schema>();
+      await db.delete(schema.mealPlan).where(eq(schema.mealPlan.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  listGrocery: defineAction({
+    description: "Lists the grocery list, unchecked first.",
+    request: z.object({}),
+    response: z.object({
+      items: z.array(z.object({
+        id: z.number(),
+        name: z.string(),
+        detail: z.string(),
+        aisle: z.string(),
+        checked: z.boolean(),
+        recipeId: z.number().nullable(),
+      })),
+    }),
+    async handler(ctx) {
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.groceryItems)
+        .orderBy(asc(schema.groceryItems.checked), asc(schema.groceryItems.id));
+      return {
+        items: rows.map((r) => ({
+          id: r.id, name: r.name, detail: r.detail, aisle: r.aisle,
+          checked: r.checked === 1, recipeId: r.recipeId,
+        })),
+      };
+    },
+  }),
+
+  addGroceryItem: defineAction({
+    description: "Adds one hand-typed item to the grocery list.",
+    request: z.object({ name: z.string().min(1), detail: z.string().default("") }),
+    response: z.object({ id: z.number() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const inserted = await db.insert(schema.groceryItems).values({
+        name: args.name.trim(),
+        detail: args.detail.trim(),
+        aisle: guessAisle(args.name),
+      }).returning({ id: schema.groceryItems.id });
+      const row = inserted[0];
+      if (!row) throw new Error("addGroceryItem: no row returned");
+      ctx.invalidateQueries();
+      return { id: row.id };
+    },
+  }),
+
+  addRecipesToGrocery: defineAction({
+    description: "Adds the ingredients of one or more recipes to the grocery list, scaling quantities and merging duplicates (2 eggs + 3 eggs = 5 eggs), sorted by supermarket aisle.",
+    request: z.object({
+      items: z.array(z.object({
+        recipeId: z.number().int(),
+        factor: z.number().positive().default(1),
+      })).min(1),
+    }),
+    response: z.object({ added: z.number() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const existing = await db.select().from(schema.groceryItems)
+        .where(eq(schema.groceryItems.checked, 0));
+      type Agg = { qty: number | null; unit: string; name: string; aisle: string; recipeId: number | null };
+      const merged = new Map<string, Agg>();
+      const keyOf = (name: string, unit: string) => `${name.toLowerCase()}|${unit.toLowerCase()}`;
+      for (const row of existing) {
+        // Existing rows store the display name; re-derive merge key from detail+name.
+        merged.set(keyOf(row.name, ""), {
+          qty: null, unit: "", name: row.name, aisle: row.aisle, recipeId: row.recipeId,
+        });
+      }
+      let added = 0;
+      const inserts: Array<typeof schema.groceryItems.$inferInsert> = [];
+      const updates: Array<{ id: number; detail: string }> = [];
+      const existingByKey = new Map(existing.map((r) => [keyOf(r.name, ""), r]));
+
+      for (const { recipeId, factor } of args.items) {
+        const rows = await db.select().from(schema.recipes).where(eq(schema.recipes.id, recipeId));
+        const recipe = rows[0];
+        if (!recipe) continue;
+        const scale = recipe.servings && recipe.servings > 0 ? factor : 1;
+        for (const line of parseJsonArray(recipe.ingredients)) {
+          const parsed = parseIngredient(line);
+          const qty = parsed.qty != null ? parsed.qty * scale : null;
+          const k = keyOf(parsed.name, parsed.unit);
+          const prev = merged.get(k);
+          if (prev && prev.qty != null && qty != null) {
+            prev.qty += qty;
+            continue;
+          }
+          if (prev) continue; // already on the list, unquantified — don't duplicate
+          merged.set(k, {
+            qty, unit: parsed.unit, name: parsed.name,
+            aisle: guessAisle(parsed.name), recipeId,
+          });
+          added++;
+        }
+      }
+
+      for (const agg of merged.values()) {
+        const detail = agg.qty != null
+          ? `${fmtQty(agg.qty)}${agg.unit ? " " + agg.unit : ""}`
+          : "";
+        const prior = existingByKey.get(keyOf(agg.name, ""));
+        if (prior) {
+          if (agg.qty != null && prior.detail !== detail) {
+            // Only rewrite detail when we actually summed quantities for it.
+            const wasMerged = args.items.length > 0 && agg.recipeId != null;
+            if (wasMerged) updates.push({ id: prior.id, detail });
+          }
+          continue;
+        }
+        inserts.push({
+          name: agg.name,
+          detail,
+          aisle: agg.aisle,
+          recipeId: agg.recipeId,
+        });
+      }
+      if (inserts.length > 0) {
+        await db.insert(schema.groceryItems).values(inserts);
+      }
+      for (const u of updates) {
+        await db.update(schema.groceryItems).set({ detail: u.detail }).where(eq(schema.groceryItems.id, u.id));
+      }
+      ctx.invalidateQueries();
+      return { added };
+    },
+  }),
+
+  setGroceryChecked: defineAction({
+    description: "Ticks or unticks one grocery item.",
+    request: z.object({ id: z.number().int(), checked: z.boolean() }),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx, args): Promise<{ ok: true }> {
+      const db = ctx.db<typeof schema>();
+      await db.update(schema.groceryItems)
+        .set({ checked: args.checked ? 1 : 0 })
+        .where(eq(schema.groceryItems.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  removeGroceryItem: defineAction({
+    description: "Removes one item from the grocery list.",
+    request: z.object({ id: z.number().int() }),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx, args): Promise<{ ok: true }> {
+      const db = ctx.db<typeof schema>();
+      await db.delete(schema.groceryItems).where(eq(schema.groceryItems.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  clearCheckedGrocery: defineAction({
+    description: "Removes every ticked-off item from the grocery list.",
+    request: z.object({}),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx): Promise<{ ok: true }> {
+      const db = ctx.db<typeof schema>();
+      await db.delete(schema.groceryItems).where(eq(schema.groceryItems.checked, 1));
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  exportLibrary: defineAction({
+    description: "Exports the whole library (recipes and collections) as structured data the user can save as a backup file — recipes are never trapped in the app.",
+    request: z.object({}),
+    response: z.object({
+      version: z.number(),
+      exportedAt: z.string(),
+      collections: z.array(z.object({ id: z.number(), name: z.string() })),
+      recipes: z.array(z.object({
+        title: z.string(),
+        description: z.string(),
+        servings: z.number().nullable(),
+        prepMinutes: z.number().nullable(),
+        cookMinutes: z.number().nullable(),
+        ingredients: z.array(z.string()),
+        steps: z.array(z.string()),
+        tags: z.array(z.string()),
+        sourceUrl: z.string().nullable(),
+        sourceName: z.string().nullable(),
+        collectionName: z.string().nullable(),
+        favorite: z.boolean(),
+        rating: z.number().nullable(),
+        status: z.enum(["want", "made"]),
+        cookCount: z.number(),
+        lastCookedAt: z.string().nullable(),
+        notes: z.string(),
+      })),
+    }),
+    async handler(ctx) {
+      const db = ctx.db<typeof schema>();
+      const collRows = await db.select().from(schema.collections).orderBy(asc(schema.collections.id));
+      const collNames = new Map(collRows.map((c) => [c.id, c.name]));
+      const rows = await db.select().from(schema.recipes).orderBy(asc(schema.recipes.id));
+      return {
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        collections: collRows.map((c) => ({ id: c.id, name: c.name })),
+        recipes: rows.map((r) => ({
+          title: r.title,
+          description: r.description,
+          servings: r.servings,
+          prepMinutes: r.prepMinutes,
+          cookMinutes: r.cookMinutes,
+          ingredients: parseJsonArray(r.ingredients),
+          steps: parseJsonArray(r.steps),
+          tags: parseJsonArray(r.tags),
+          sourceUrl: r.sourceUrl,
+          sourceName: r.sourceName,
+          collectionName: r.collectionId != null ? (collNames.get(r.collectionId) ?? null) : null,
+          favorite: r.favorite === 1,
+          rating: r.rating,
+          status: r.status,
+          cookCount: r.cookCount,
+          lastCookedAt: r.lastCookedAt,
+          notes: r.notes,
+        })),
+      };
+    },
+  }),
+
+  importBackup: defineAction({
+    description: "Imports recipes from a Kitchen Companion backup file, skipping any whose title already exists in the library.",
+    request: z.object({
+      collections: z.array(z.object({ name: z.string() })).default([]),
+      recipes: z.array(z.object({
+        title: z.string().min(1),
+        description: z.string().default(""),
+        servings: z.number().int().positive().nullable().default(null),
+        prepMinutes: z.number().int().nonnegative().nullable().default(null),
+        cookMinutes: z.number().int().nonnegative().nullable().default(null),
+        ingredients: z.array(z.string()).default([]),
+        steps: z.array(z.string()).default([]),
+        tags: z.array(z.string()).default([]),
+        sourceUrl: z.string().nullable().default(null),
+        sourceName: z.string().nullable().default(null),
+        collectionName: z.string().nullable().default(null),
+        favorite: z.boolean().default(false),
+        rating: z.number().int().min(1).max(5).nullable().default(null),
+        status: z.enum(["want", "made"]).default("want"),
+        cookCount: z.number().int().nonnegative().default(0),
+        lastCookedAt: z.string().nullable().default(null),
+        notes: z.string().default(""),
+      })).default([]),
+    }),
+    response: z.object({ imported: z.number(), skipped: z.number() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const existingColls = await db.select().from(schema.collections);
+      const collIdByName = new Map(existingColls.map((c) => [c.name.toLowerCase(), c.id]));
+      for (const c of args.collections) {
+        const key = c.name.trim().toLowerCase();
+        if (!key || collIdByName.has(key)) continue;
+        const inserted = await db.insert(schema.collections)
+          .values({ name: c.name.trim() })
+          .returning({ id: schema.collections.id });
+        const row = inserted[0];
+        if (row) collIdByName.set(key, row.id);
+      }
+      const existingTitles = new Set(
+        (await db.select({ title: schema.recipes.title }).from(schema.recipes))
+          .map((r) => r.title.trim().toLowerCase()),
+      );
+      let imported = 0;
+      let skipped = 0;
+      for (const r of args.recipes) {
+        const titleKey = r.title.trim().toLowerCase();
+        if (existingTitles.has(titleKey)) { skipped++; continue; }
+        existingTitles.add(titleKey);
+        await db.insert(schema.recipes).values({
+          title: r.title.trim(),
+          description: r.description,
+          servings: r.servings,
+          prepMinutes: r.prepMinutes,
+          cookMinutes: r.cookMinutes,
+          ingredients: JSON.stringify(r.ingredients),
+          steps: JSON.stringify(r.steps),
+          tags: JSON.stringify(r.tags.map((t) => t.toLowerCase())),
+          sourceUrl: r.sourceUrl,
+          sourceName: r.sourceName,
+          collectionId: r.collectionName ? (collIdByName.get(r.collectionName.trim().toLowerCase()) ?? null) : null,
+          favorite: r.favorite ? 1 : 0,
+          rating: r.rating,
+          status: r.status,
+          cookCount: r.cookCount,
+          lastCookedAt: r.lastCookedAt,
+          notes: r.notes,
+        });
+        imported++;
+      }
+      ctx.invalidateQueries();
+      return { imported, skipped };
+    },
+  }),
+
+  // ---------- Jewel-Osco shopping ----------
+  // Jewel-Osco has no public API for third-party apps, so the flow is a
+  // handoff, not a sync: Kitchen Companion builds the cart here, the user
+  // opens Jewel-Osco's own site, signs in there (credentials never enter
+  // this app), and reviews/pays there. These actions persist the store
+  // choice and the carts built, so the flow is real recorded state.
+
+  getShop: defineAction({
+    description: "Returns the saved grocery store (Jewel-Osco by default), the Jewel-Osco ordering link, and the history of Jewel carts built in the app.",
+    request: z.object({}),
+    response: z.object({
+      storeName: z.string(),
+      storeLocation: z.string(),
+      jewelUrl: z.string(),
+      orders: z.array(jewelOrderDto),
+    }),
+    async handler(ctx) {
+      const db = ctx.db<typeof schema>();
+      const [storeName, storeLocation] = await Promise.all([
+        getSetting(ctx, "store_name", "Jewel-Osco"),
+        getSetting(ctx, "store_location", "Plainfield, IL"),
+      ]);
+      const rows = await db.select().from(schema.jewelOrders)
+        .orderBy(desc(schema.jewelOrders.id)).limit(20);
+      return {
+        storeName,
+        storeLocation,
+        jewelUrl: JEWEL_URL,
+        orders: rows.map(orderToDto),
+      };
+    },
+  }),
+
+  setStore: defineAction({
+    description: "Saves the household's main grocery store name and location, shown on the Shop tab and stamped onto every Jewel cart built.",
+    request: z.object({
+      storeName: z.string().min(1),
+      storeLocation: z.string().default(""),
+    }),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx, args): Promise<{ ok: true }> {
+      const db = ctx.db<typeof schema>();
+      await db.insert(schema.appSettings)
+        .values({ key: "store_name", value: args.storeName.trim() })
+        .onConflictDoUpdate({ target: schema.appSettings.key, set: { value: args.storeName.trim() } });
+      await db.insert(schema.appSettings)
+        .values({ key: "store_location", value: args.storeLocation.trim() })
+        .onConflictDoUpdate({ target: schema.appSettings.key, set: { value: args.storeLocation.trim() } });
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  buildJewelCart: defineAction({
+    description: "Builds a Jewel-Osco cart from the shopping list: optionally from one recipe's ingredients at a chosen servings scale, or from every unticked grocery item. Saves the cart and returns it ready to copy or take to Jewel-Osco's site.",
+    request: z.object({
+      recipeId: z.number().int().nullable().default(null),
+      servings: z.number().int().positive().nullable().default(null),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+      order: jewelOrderDto.nullable(),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const storeName = await getSetting(ctx, "store_name", "Jewel-Osco");
+      const storeLocation = await getSetting(ctx, "store_location", "Plainfield, IL");
+      type CartItem = { name: string; detail: string };
+      const items: CartItem[] = [];
+      const itemIds: number[] = [];
+
+      if (args.recipeId != null) {
+        const rows = await db.select().from(schema.recipes).where(eq(schema.recipes.id, args.recipeId));
+        const recipe = rows[0];
+        if (!recipe) return { ok: false, error: "That recipe could not be found.", order: null };
+        const factor = recipe.servings && recipe.servings > 0 && args.servings
+          ? args.servings / recipe.servings
+          : 1;
+        const merged = new Map<string, { qty: number | null; unit: string; name: string }>();
+        for (const line of parseJsonArray(recipe.ingredients)) {
+          const parsed = parseIngredient(line);
+          const qty = parsed.qty != null ? parsed.qty * factor : null;
+          const k = `${parsed.name.toLowerCase()}|${parsed.unit.toLowerCase()}`;
+          const prev = merged.get(k);
+          if (prev && prev.qty != null && qty != null) { prev.qty += qty; continue; }
+          if (prev) continue;
+          merged.set(k, { qty, unit: parsed.unit, name: parsed.name });
+        }
+        for (const agg of merged.values()) {
+          items.push({
+            name: agg.name,
+            detail: agg.qty != null ? `${fmtQty(agg.qty)}${agg.unit ? " " + agg.unit : ""}` : "",
+          });
+        }
+        if (items.length === 0) {
+          return { ok: false, error: "This recipe has no ingredients to shop for yet.", order: null };
+        }
+      } else {
+        const rows = await db.select().from(schema.groceryItems)
+          .where(eq(schema.groceryItems.checked, 0))
+          .orderBy(asc(schema.groceryItems.id));
+        for (const r of rows) {
+          items.push({ name: r.name, detail: r.detail });
+          itemIds.push(r.id);
+        }
+        if (items.length === 0) {
+          return { ok: false, error: "Your shopping list is empty — add a recipe's ingredients first, then build the cart.", order: null };
+        }
+      }
+
+      const inserted = await db.insert(schema.jewelOrders).values({
+        storeName,
+        storeLocation,
+        items: JSON.stringify(items),
+        itemIds: JSON.stringify(itemIds),
+        status: "built",
+      }).returning();
+      const row = inserted[0];
+      if (!row) throw new Error("buildJewelCart: no row returned");
+      ctx.invalidateQueries();
+      return { ok: true, error: null, order: orderToDto(row) };
+    },
+  }),
+
+  markJewelOrderSent: defineAction({
+    description: "Marks a built Jewel cart as ordered at Jewel-Osco and clears the grocery items it was built from off the shopping list.",
+    request: z.object({ id: z.number().int() }),
+    response: z.object({ ok: z.literal(true), cleared: z.number() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.jewelOrders).where(eq(schema.jewelOrders.id, args.id));
+      const row = rows[0];
+      if (!row) throw new Error("markJewelOrderSent: order not found");
+      await db.update(schema.jewelOrders)
+        .set({ status: "sent" })
+        .where(eq(schema.jewelOrders.id, args.id));
+      let cleared = 0;
+      for (const gid of parseJsonIds(row.itemIds)) {
+        await db.delete(schema.groceryItems).where(eq(schema.groceryItems.id, gid));
+        cleared++;
+      }
+      ctx.invalidateQueries();
+      return { ok: true as const, cleared };
+    },
+  }),
+
+  deleteJewelOrder: defineAction({
+    description: "Removes one built Jewel cart from the order history. The shopping list is not changed.",
+    request: z.object({ id: z.number().int() }),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx, args): Promise<{ ok: true }> {
+      const db = ctx.db<typeof schema>();
+      await db.delete(schema.jewelOrders).where(eq(schema.jewelOrders.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  seedExamples: defineAction({
+    description: "Pre-loads the two example recipes Anthony asked to ship in the box: the sausage & sauerkraut with MASHED potatoes casserole (Stockpiling Moms' Polish Sausage Casserole, the Pinterest-favourite version of Anthony's favourite dish) and the top-rated homemade lasagna from Baker by Nature (4.99/5). Each is imported live through the normal import pipeline and tagged 'example'. Idempotent: any example already in the library is skipped, and a failed import is reported, never faked.",
+    request: z.object({}),
+    response: z.object({
+      seeded: z.array(z.string()),
+      skipped: z.array(z.string()),
+      failed: z.array(z.string()),
+    }),
+    async handler(ctx) {
+      const db = ctx.db<typeof schema>();
+      const examples: Array<{ label: string; url: string; titleKeyword: string; note: string }> = [
+        {
+          label: "Sausage & sauerkraut with mashed potatoes (example)",
+          url: "https://stockpilingmoms.com/polish-sausage-casserole/",
+          titleKeyword: "sausage casserole",
+          note: "⭐ Example recipe — sausage and sauerkraut with mashed potatoes, Anthony's favourite dish. This is Stockpiling Moms' Polish Sausage Casserole, a Pinterest favourite, imported so a full recipe is in the box from day one. Make it your own, or delete it any time.",
+        },
+        {
+          label: "Top-rated homemade lasagna (example)",
+          url: "https://bakerbynature.com/the-best-homemade-lasagna-recipe/?fbclid=IwAR042vzN7ZotdRtoyBIGOcmYUKz-0boEk_oYi3KNcVtmwmrHBUDNiTHY3Mw",
+          titleKeyword: "lasagna",
+          note: "⭐ Example recipe — the top-rated homemade lasagna we found (rated 4.99 out of 5 from 76 reviews at Baker by Nature), imported so a full recipe is in the box from day one. Make it your own, or delete it any time.",
+        },
+      ];
+      const existing = await db.select({ title: schema.recipes.title }).from(schema.recipes);
+      const existingTitles = existing.map((r) => r.title.toLowerCase());
+      const seeded: string[] = [];
+      const skipped: string[] = [];
+      const failed: string[] = [];
+      for (const ex of examples) {
+        if (existingTitles.some((t) => t.includes(ex.titleKeyword))) {
+          skipped.push(ex.label);
+          continue;
+        }
+        let res: DraftResponse;
+        try {
+          res = await draftFromUrl(ctx, ex.url);
+        } catch {
+          failed.push(ex.label);
+          continue;
+        }
+        if (!res.ok || !res.draft) {
+          failed.push(ex.label);
+          continue;
+        }
+        const d = res.draft;
+        const tags = ["example", ...d.tags.filter((t) => t !== "example")].slice(0, 8);
+        await db.insert(schema.recipes).values({
+          title: d.title,
+          description: d.description,
+          servings: d.servings,
+          prepMinutes: d.prepMinutes,
+          cookMinutes: d.cookMinutes,
+          ingredients: JSON.stringify(d.ingredients),
+          steps: JSON.stringify(splitSeedSteps(d.steps)),
+          tags: JSON.stringify(tags),
+          sourceUrl: d.sourceUrl,
+          sourceName: d.sourceName,
+          notes: ex.note,
+          sourcePhotoKey: d.sourcePhotoKey,
+          scanPhotoKey: d.scanPhotoKey,
+          attachmentName: d.attachmentName,
+        });
+        existingTitles.push(d.title.toLowerCase());
+        seeded.push(d.title);
+      }
+      ctx.invalidateQueries();
+      return { seeded, skipped, failed };
+    },
+  }),
+} satisfies ActionsModule;

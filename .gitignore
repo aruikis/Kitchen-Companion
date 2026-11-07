@@ -1,0 +1,13 @@
+node_modules/
+app.db
+app.db-shm
+app.db-wal
+blobs/
+audits/
+dist/
+.space-build/
+.space-build-cvm/
+.harness/
+.bun-cache/
+*.tsbuildinfo
+.xmds-icon
