@@ -993,6 +993,83 @@ async function draftFromUrl(ctx: Ctx, url: string): Promise<DraftResponse> {
   }
 }
 
+// Turns recipe words into a structured draft for review. Shared by the
+// structureText action (paste / text-file upload) and by email staging,
+// so an email's recipe goes through exactly the same pipeline.
+async function draftFromText(ctx: Ctx, text: string): Promise<DraftResponse> {
+  try {
+    const structured = await ctx.inference.complete(
+      "Turn this text into a clean structured recipe. Keep the cook's own quantities and wording; split ingredients and steps into separate entries.",
+      { schema: inferenceDraftSchema, system: "Recipe text:\n\n" + text.slice(0, 20000) },
+    );
+    const cleaned = cleanDraft(structured);
+    return {
+      ok: true,
+      error: null,
+      draft: {
+        ...cleaned,
+        pageNeedsRotation: "none",
+        sourceUrl: null,
+        sourceName: null,
+        sourcePhotoKey: null,
+        scanPhotoKey: null,
+        attachmentName: null,
+        attachmentKey: null,
+      },
+    };
+  } catch {
+    return emptyDraftError("That text could not be turned into a recipe automatically. You can still type the recipe in by hand.");
+  }
+}
+
+// Reads a photo of a recipe page with vision OCR and returns a draft; the
+// photo itself is stored as the recipe's original either way. Shared by
+// the scanImage action and by email staging (an emailed photo of a recipe
+// card is read exactly like a scan).
+async function draftFromImage(
+  ctx: Ctx,
+  dataBase64: string,
+  mimeType: "image/jpeg" | "image/png",
+): Promise<DraftResponse> {
+  const bytes = Uint8Array.from(atob(dataBase64), (c) => c.charCodeAt(0));
+  const key = `scan/${crypto.randomUUID()}`;
+  await ctx.blobs.put(key, bytes, { contentType: mimeType });
+  try {
+    const structured = await ctx.inference.complete(
+      "Read the recipe in this photo and return it structured. Transcribe quantities and steps exactly as written; if handwriting is unclear, make your best reading — the cook will check and fix it on the next screen. Also judge how the page sits in the photo and report pageNeedsRotation: the clockwise rotation, in degrees, that would make the page right-side up ('none' if it already is).",
+      {
+        schema: scanDraftSchema,
+        images: [{ dataBase64, mimeType, caption: "Photo of a recipe page or card" }],
+      },
+    );
+    const cleaned = cleanDraft(structured);
+    return {
+      ok: true,
+      error: null,
+      draft: {
+        ...cleaned,
+        pageNeedsRotation: structured.pageNeedsRotation,
+        sourceUrl: null,
+        sourceName: "Scanned page",
+        sourcePhotoKey: null,
+        scanPhotoKey: key,
+        attachmentName: null,
+        attachmentKey: null,
+      },
+    };
+  } catch {
+    return {
+      ok: false,
+      error: "The photo could not be read automatically. It has been kept — you can type the recipe in by hand on the review screen.",
+      draft: {
+        ...blankDraft(),
+        sourceName: "Scanned page",
+        scanPhotoKey: key,
+      },
+    };
+  }
+}
+
 // ---------- shared backend: profiles, friends, sharing, server backup ----------
 // Kitchen Companion's shared features live on the same Supabase project
 // Vault X uses (Anthony's project, created Nov 2, 2026) — project URL and
@@ -1179,33 +1256,138 @@ async function pushPendingShares(ctx: Ctx): Promise<number> {
 
 // ---------- actions ----------
 
+const draftObject = z.object({
+  title: z.string(),
+  description: z.string(),
+  servings: z.number().nullable(),
+  prepMinutes: z.number().nullable(),
+  cookMinutes: z.number().nullable(),
+  ingredients: z.array(z.string()),
+  steps: z.array(z.string()),
+  tags: z.array(z.string()),
+  course: z.string().nullable(),
+  protein: z.string().nullable(),
+  pageNeedsRotation: z.enum(["none", "90", "180", "270"]),
+  sourceUrl: z.string().nullable(),
+  sourceName: z.string().nullable(),
+  sourcePhotoKey: z.string().nullable(),
+  scanPhotoKey: z.string().nullable(),
+  attachmentName: z.string().nullable(),
+  attachmentKey: z.string().nullable(),
+});
+type DraftObject = z.infer<typeof draftObject>;
+
 const draftResponse = z.object({
   ok: z.boolean(),
   error: z.string().nullable(),
-  draft: z.object({
-    title: z.string(),
-    description: z.string(),
-    servings: z.number().nullable(),
-    prepMinutes: z.number().nullable(),
-    cookMinutes: z.number().nullable(),
-    ingredients: z.array(z.string()),
-    steps: z.array(z.string()),
-    tags: z.array(z.string()),
-    course: z.string().nullable(),
-    protein: z.string().nullable(),
-    pageNeedsRotation: z.enum(["none", "90", "180", "270"]),
-    sourceUrl: z.string().nullable(),
-    sourceName: z.string().nullable(),
-    sourcePhotoKey: z.string().nullable(),
-    scanPhotoKey: z.string().nullable(),
-    attachmentName: z.string().nullable(),
-    attachmentKey: z.string().nullable(),
-  }).nullable(),
+  draft: draftObject.nullable(),
 });
 type DraftResponse = z.infer<typeof draftResponse>;
 
 function emptyDraftError(error: string): DraftResponse {
   return { ok: false, error, draft: null };
+}
+
+function blankDraft(): DraftObject {
+  return {
+    title: "Untitled recipe",
+    description: "",
+    servings: null,
+    prepMinutes: null,
+    cookMinutes: null,
+    ingredients: [],
+    steps: [],
+    tags: [],
+    course: null,
+    protein: null,
+    pageNeedsRotation: "none",
+    sourceUrl: null,
+    sourceName: null,
+    sourcePhotoKey: null,
+    scanPhotoKey: null,
+    attachmentName: null,
+    attachmentKey: null,
+  };
+}
+
+// ---------- email import staging (v1.5.0) ----------
+// Recipes found in the user's email wait in staged_imports until the cook
+// reviews them. The staging action below is what the user's own Muse
+// calls from outside the app after searching their connected mailbox —
+// the app itself never reads email and never sees an email password.
+// Duplicate protection: a staged title is compared against the library
+// (and against what is already waiting) with a forgiving similarity test,
+// so "Grandma's Tomato Soup" and "Grandma's tomato soup!" count as the
+// same dish; matches are flagged, never silently dropped or saved.
+
+function normalizeTitle(t: string): string {
+  return t.toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function titlesSimilar(a: string, b: string): boolean {
+  const na = normalizeTitle(a);
+  const nb = normalizeTitle(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  const shorter = na.length <= nb.length ? na : nb;
+  const longer = na.length <= nb.length ? nb : na;
+  if (shorter.length >= 6 && longer.includes(shorter)) return true;
+  const wa = new Set(na.split(" ").filter((w) => w.length > 2));
+  const wb = new Set(nb.split(" ").filter((w) => w.length > 2));
+  if (wa.size === 0 || wb.size === 0) return false;
+  let shared = 0;
+  for (const w of wa) if (wb.has(w)) shared++;
+  return shared / Math.min(wa.size, wb.size) >= 0.6;
+}
+
+async function findSimilarRecipeTitle(ctx: Ctx, title: string): Promise<string | null> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db.select({ title: schema.recipes.title }).from(schema.recipes);
+  const hit = rows.find((r) => titlesSimilar(r.title, title));
+  return hit ? hit.title : null;
+}
+
+const stagedImportDto = z.object({
+  id: z.number(),
+  title: z.string(),
+  senderName: z.string(),
+  senderEmail: z.string(),
+  subject: z.string(),
+  emailDate: z.string().nullable(),
+  rawText: z.string().nullable(),
+  draft: draftObject.nullable(),
+  similarTitle: z.string().nullable(),
+  scanPhotoUrl: z.string().nullable(),
+  createdAt: z.string(),
+});
+
+type StagedRow = typeof schema.stagedImports.$inferSelect;
+
+async function stagedToDto(ctx: Ctx, row: StagedRow): Promise<z.infer<typeof stagedImportDto>> {
+  let draft: DraftObject | null = null;
+  try {
+    const parsed = draftObject.safeParse(JSON.parse(row.draft));
+    if (parsed.success) draft = parsed.data;
+  } catch {
+    draft = null;
+  }
+  const [similarTitle, scanPhotoUrl] = await Promise.all([
+    findSimilarRecipeTitle(ctx, row.title),
+    safePhotoUrl(ctx, draft?.scanPhotoKey ?? null),
+  ]);
+  return {
+    id: row.id,
+    title: row.title,
+    senderName: row.senderName,
+    senderEmail: row.senderEmail,
+    subject: row.subject,
+    emailDate: row.emailDate,
+    rawText: row.rawText,
+    draft,
+    similarTitle,
+    scanPhotoUrl,
+    createdAt: row.createdAt.toISOString(),
+  };
 }
 
 export const Actions = {
@@ -1512,29 +1694,7 @@ export const Actions = {
     request: z.object({ text: z.string().min(10).max(20000) }),
     response: draftResponse,
     async handler(ctx, args): Promise<DraftResponse> {
-      try {
-        const structured = await ctx.inference.complete(
-          "Turn this text into a clean structured recipe. Keep the cook's own quantities and wording; split ingredients and steps into separate entries.",
-          { schema: inferenceDraftSchema, system: "Recipe text:\n\n" + args.text },
-        );
-        const cleaned = cleanDraft(structured);
-        return {
-          ok: true,
-          error: null,
-          draft: {
-            ...cleaned,
-            pageNeedsRotation: "none",
-            sourceUrl: null,
-            sourceName: null,
-            sourcePhotoKey: null,
-            scanPhotoKey: null,
-            attachmentName: null,
-            attachmentKey: null,
-          },
-        };
-      } catch {
-        return emptyDraftError("That text could not be turned into a recipe automatically. You can still type the recipe in by hand.");
-      }
+      return draftFromText(ctx, args.text);
     },
   }),
 
@@ -1546,57 +1706,7 @@ export const Actions = {
     }),
     response: draftResponse,
     async handler(ctx, args): Promise<DraftResponse> {
-      const bytes = Uint8Array.from(atob(args.dataBase64), (c) => c.charCodeAt(0));
-      const key = `scan/${crypto.randomUUID()}`;
-      await ctx.blobs.put(key, bytes, { contentType: args.mimeType });
-      try {
-        const structured = await ctx.inference.complete(
-          "Read the recipe in this photo and return it structured. Transcribe quantities and steps exactly as written; if handwriting is unclear, make your best reading — the cook will check and fix it on the next screen. Also judge how the page sits in the photo and report pageNeedsRotation: the clockwise rotation, in degrees, that would make the page right-side up ('none' if it already is).",
-          {
-            schema: scanDraftSchema,
-            images: [{ dataBase64: args.dataBase64, mimeType: args.mimeType, caption: "Photo of a recipe page or card" }],
-          },
-        );
-        const cleaned = cleanDraft(structured);
-        return {
-          ok: true,
-          error: null,
-          draft: {
-            ...cleaned,
-            pageNeedsRotation: structured.pageNeedsRotation,
-            sourceUrl: null,
-            sourceName: "Scanned page",
-            sourcePhotoKey: null,
-            scanPhotoKey: key,
-            attachmentName: null,
-            attachmentKey: null,
-          },
-        };
-      } catch {
-        return {
-          ok: false,
-          error: "The photo could not be read automatically. It has been kept — you can type the recipe in by hand on the review screen.",
-          draft: {
-            title: "Untitled recipe",
-            description: "",
-            servings: null,
-            prepMinutes: null,
-            cookMinutes: null,
-            ingredients: [],
-            steps: [],
-            tags: [],
-            course: null,
-            protein: null,
-            pageNeedsRotation: "none",
-            sourceUrl: null,
-            sourceName: "Scanned page",
-            sourcePhotoKey: null,
-            scanPhotoKey: key,
-            attachmentName: null,
-            attachmentKey: null,
-          },
-        };
-      }
+      return draftFromImage(ctx, args.dataBase64, args.mimeType);
     },
   }),
 
@@ -2798,6 +2908,181 @@ export const Actions = {
       } catch {
         return { status: "unknown" as const, ...base };
       }
+    },
+  }),
+
+  stageEmailImport: defineAction({
+    description: "Stages a recipe found in the user's email into Kitchen Companion's import inbox for the cook's review — called by the user's own Muse after searching their connected mailbox (the app itself never reads email). Accepts the recipe's words (the email body or a transcription), and/or ONE attached file as base64 (a photo of a recipe card, a text file, or a PDF), plus where it came from: sender name, sender email, email subject, and the email's date. The recipe runs through the app's normal import pipeline (text structuring / photo OCR, automatic categories) and waits in the import inbox — nothing is saved into the recipe library until the cook checks, edits, and approves it on the review screen. If a recipe with the same or a very similar title is already in the library, the response and the review screen flag it so the cook can skip it.",
+    request: z.object({
+      senderName: z.string().default(""),
+      senderEmail: z.string().default(""),
+      subject: z.string().default(""),
+      emailDate: z.string().nullable().default(null),
+      text: z.string().max(40000).nullable().default(null),
+      attachment: z.object({
+        filename: z.string().min(1),
+        mimeType: z.string().min(1),
+        dataBase64: z.string().min(1),
+      }).nullable().default(null),
+    }),
+    response: z.object({
+      ok: z.literal(true),
+      stagedId: z.number(),
+      title: z.string(),
+      alreadyWaiting: z.boolean(),
+      similarTitle: z.string().nullable(),
+      note: z.string(),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const senderName = args.senderName.trim();
+      const senderEmail = args.senderEmail.trim();
+      const subject = args.subject.trim();
+      const fromLabel = senderName || senderEmail || "an email";
+      const sourceName = `Email from ${fromLabel}`;
+      const att = args.attachment ?? null;
+      const bodyText = (args.text ?? "").trim();
+
+      let draft: DraftObject | null = null;
+      let readNote: string | null = null;
+
+      if (att && (att.mimeType === "image/jpeg" || att.mimeType === "image/png")) {
+        // An emailed photo of a recipe card/page is read exactly like a scan.
+        const res = await draftFromImage(ctx, att.dataBase64, att.mimeType);
+        draft = res.draft;
+        if (!res.ok) {
+          readNote = "The attached photo could not be read automatically — it is kept with the recipe so the cook can type it up on the review screen.";
+        }
+      } else if (att && (att.mimeType.startsWith("text/") || /\.(txt|md)$/i.test(att.filename))) {
+        // A text file: structure its words AND keep the file itself attached.
+        try {
+          const bytes = Uint8Array.from(atob(att.dataBase64), (c) => c.charCodeAt(0));
+          const fileText = new TextDecoder().decode(bytes);
+          const res = await draftFromText(ctx, fileText);
+          draft = res.draft;
+          if (!draft) readNote = "The attached text file could not be turned into a recipe automatically.";
+        } catch {
+          readNote = "The attached file could not be read.";
+        }
+        const key = await storeBlobAsset(ctx, { mimeType: att.mimeType, dataBase64: att.dataBase64 }, "file");
+        if (draft) draft = { ...draft, attachmentName: att.filename, attachmentKey: key };
+        else {
+          draft = { ...blankDraft(), attachmentName: att.filename, attachmentKey: key };
+        }
+      } else if (att) {
+        // A PDF or other document: the original is kept attached; the
+        // email's own words, when present, become the recipe draft.
+        const key = await storeBlobAsset(ctx, { mimeType: att.mimeType, dataBase64: att.dataBase64 }, "file");
+        if (bodyText.length >= 10) {
+          const res = await draftFromText(ctx, bodyText);
+          draft = res.draft;
+        }
+        if (!draft) {
+          draft = blankDraft();
+          readNote = "The attached file is kept with the recipe; its words could not be read automatically, so the cook fills the recipe in on the review screen.";
+        }
+        draft = { ...draft, attachmentName: att.filename, attachmentKey: key };
+      }
+
+      if (!draft && bodyText.length >= 10) {
+        const res = await draftFromText(ctx, bodyText);
+        draft = res.draft;
+        if (!draft) readNote = "The email's words could not be turned into a recipe automatically — a blank recipe was staged with the email kept attached for the cook.";
+      }
+      if (!draft) {
+        draft = blankDraft();
+        if (!readNote) readNote = "Nothing readable was found in this email — a blank recipe was staged for the cook to fill in.";
+      }
+
+      if (!draft.title || draft.title === "Untitled recipe") {
+        draft = { ...draft, title: subject || "Untitled recipe" };
+      }
+      draft = { ...draft, sourceUrl: null, sourceName };
+      if (!asCourse(draft.course) || !asProtein(draft.protein)) {
+        const cats = await autoCategorize(ctx, {
+          title: draft.title,
+          description: draft.description,
+          ingredients: draft.ingredients,
+          prepMinutes: draft.prepMinutes,
+          cookMinutes: draft.cookMinutes,
+        });
+        draft = { ...draft, course: asCourse(draft.course) ?? cats.course, protein: asProtein(draft.protein) ?? cats.protein };
+      }
+
+      const similarTitle = await findSimilarRecipeTitle(ctx, draft.title);
+
+      // The same recipe from the same email staged twice (a search run
+      // twice, say) waits only once.
+      const waiting = await db.select().from(schema.stagedImports);
+      const already = waiting.find(
+        (w) =>
+          titlesSimilar(w.title, draft.title) &&
+          w.senderEmail.toLowerCase() === senderEmail.toLowerCase() &&
+          w.subject === subject,
+      );
+      if (already) {
+        return {
+          ok: true as const,
+          stagedId: already.id,
+          title: already.title,
+          alreadyWaiting: true,
+          similarTitle,
+          note: `“${already.title}” from that email is already waiting in Kitchen Companion's import inbox for review, so nothing new was staged.`,
+        };
+      }
+
+      const inserted = await db.insert(schema.stagedImports).values({
+        title: draft.title,
+        draft: JSON.stringify(draft),
+        senderName,
+        senderEmail,
+        subject,
+        emailDate: args.emailDate,
+        rawText: bodyText ? bodyText.slice(0, 20000) : null,
+      }).returning({ id: schema.stagedImports.id });
+      const row = inserted[0];
+      if (!row) throw new Error("stageEmailImport: no row returned");
+      ctx.invalidateQueries();
+
+      const notes: string[] = [
+        `Staged “${draft.title}” in Kitchen Companion's import inbox for review — nothing is saved into the recipe library until the cook checks and approves it there.`,
+      ];
+      if (similarTitle) {
+        notes.push(`It looks like a recipe already in the library (“${similarTitle}”), so the review screen flags it and the cook can skip it.`);
+      }
+      if (readNote) notes.push(readNote);
+      return {
+        ok: true as const,
+        stagedId: row.id,
+        title: draft.title,
+        alreadyWaiting: false,
+        similarTitle,
+        note: notes.join(" "),
+      };
+    },
+  }),
+
+  listStagedImports: defineAction({
+    description: "Lists the recipes waiting in the import inbox (delivered from email by the user's Muse), newest first, each with its review-ready draft, where the email came from, and the title of a similar recipe already in the library when there is one.",
+    request: z.object({}),
+    response: z.object({ items: z.array(stagedImportDto) }),
+    async handler(ctx) {
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.stagedImports).orderBy(desc(schema.stagedImports.id));
+      const items = await Promise.all(rows.map((r) => stagedToDto(ctx, r)));
+      return { items };
+    },
+  }),
+
+  discardStagedImport: defineAction({
+    description: "Removes one recipe from the import inbox without saving it (the cook decided not to keep it, or it was a duplicate).",
+    request: z.object({ id: z.number().int() }),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx, args): Promise<{ ok: true }> {
+      const db = ctx.db<typeof schema>();
+      await db.delete(schema.stagedImports).where(eq(schema.stagedImports.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true };
     },
   }),
 

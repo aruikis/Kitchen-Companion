@@ -43,6 +43,13 @@
       "when": 1794240383844,
       "tag": "0006_add_profiles_friends_shares_tables",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1794247792120,
+      "tag": "0007_add_staged_imports_table",
+      "breakpoints": true
     }
   ]
 }

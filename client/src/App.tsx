@@ -14,12 +14,45 @@ type ProfileInfo = ApiResponse<typeof api, "getProfile">;
 type MyProfile = NonNullable<ProfileInfo["profile"]>;
 type FriendsInfo = ApiResponse<typeof api, "getFriends">;
 type PlanEntry = ApiResponse<typeof api, "listPlan">["entries"][number];
+type StagedItem = ApiResponse<typeof api, "listStagedImports">["items"][number];
 
 type Tab = "recipes" | "add" | "plan" | "shop" | "friends" | "settings";
 type View =
   | { kind: "main" }
   | { kind: "recipe"; id: number }
-  | { kind: "review"; draft: NonNullable<Draft>; editingId: number | null; previewUrl: string | null };
+  | {
+      kind: "review";
+      draft: NonNullable<Draft>;
+      editingId: number | null;
+      previewUrl: string | null;
+      stagedId?: number | null;
+      sourceNote?: string | null;
+      rawText?: string | null;
+    };
+
+// Forgiving title comparison for duplicate warnings — the same rules the
+// server uses when it flags a staged email recipe: punctuation and case
+// don't matter, one title containing the other counts, and so does heavy
+// word overlap ("Grandma's Tomato Soup" ≈ "Tomato soup, Grandma's").
+function normalizeTitle(t: string): string {
+  return t.toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function titlesSimilar(a: string, b: string): boolean {
+  const na = normalizeTitle(a);
+  const nb = normalizeTitle(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  const shorter = na.length <= nb.length ? na : nb;
+  const longer = na.length <= nb.length ? nb : na;
+  if (shorter.length >= 6 && longer.includes(shorter)) return true;
+  const wa = new Set(na.split(" ").filter((w) => w.length > 2));
+  const wb = new Set(nb.split(" ").filter((w) => w.length > 2));
+  if (wa.size === 0 || wb.size === 0) return false;
+  let shared = 0;
+  for (const w of wa) if (wb.has(w)) shared++;
+  return shared / Math.min(wa.size, wb.size) >= 0.6;
+}
 
 // ---------- small helpers ----------
 
@@ -112,7 +145,7 @@ const JEWEL_URL = "https://www.jewelosco.com/";
 
 // Visible version (Anthony's standing rule: the UAT carries its version
 // number in the app, and the GitHub push of this build is tagged with it).
-const APP_VERSION = "1.4.0";
+const APP_VERSION = "1.5.0";
 
 // Automatic categories (chosen by the app when a recipe is added; the cook
 // can correct them). Mirrors the server's lists in actions.ts.
@@ -543,9 +576,31 @@ export function App() {
     }
   }, [backupStatusQ.data, recipesQ.isPending, recipes, queryClient]);
 
+  // Recipes Muse delivered from email wait here for review — the count
+  // drives the banner on the Recipes tab, and the Add tab's import inbox
+  // reads the same query.
+  const stagedQ = useQuery({ queryKey: ["stagedImports"], queryFn: () => api.listStagedImports({}) });
+  const stagedItems = stagedQ.data?.items ?? [];
+
   const openRecipe = (id: number) => setView({ kind: "recipe", id });
   const openReview = (draft: NonNullable<Draft>, editingId: number | null, previewUrl: string | null) =>
     setView({ kind: "review", draft, editingId, previewUrl });
+  const openStagedReview = (item: StagedItem) => {
+    if (!item.draft) return;
+    const from = item.senderName || item.senderEmail || "an email";
+    const bits = [`from ${from}`];
+    if (item.subject) bits.push(`“${item.subject}”`);
+    if (item.emailDate) bits.push(item.emailDate);
+    setView({
+      kind: "review",
+      draft: item.draft,
+      editingId: null,
+      previewUrl: item.scanPhotoUrl,
+      stagedId: item.id,
+      sourceNote: `📧 This recipe came from your email — ${bits.join(" · ")}. The original email is kept below${item.draft.attachmentName ? ", with its file attached" : ""}.`,
+      rawText: item.rawText,
+    });
+  };
 
   if (profileQ.isPending) {
     return (
@@ -612,6 +667,9 @@ export function App() {
             draft={view.draft}
             editingId={view.editingId}
             previewUrl={view.previewUrl}
+            stagedId={view.stagedId ?? null}
+            sourceNote={view.sourceNote ?? null}
+            rawText={view.rawText ?? null}
             collections={collections}
             recipes={recipes}
             onDone={(recipeId) => {
@@ -628,12 +686,13 @@ export function App() {
             error={recipesQ.error ? String(recipesQ.error) : null}
             updateInfo={updateInfo}
             profile={profile}
+            stagedCount={stagedItems.length}
             onOpenSettings={() => setTab("settings")}
             onOpen={openRecipe}
             onAdd={() => setTab("add")}
           />
         ) : tab === "add" ? (
-          <AddRecipe onReview={openReview} />
+          <AddRecipe onReview={openReview} onReviewStaged={openStagedReview} />
         ) : tab === "plan" ? (
           <Planner recipes={recipes} onOpen={openRecipe} />
         ) : tab === "shop" ? (
@@ -700,7 +759,7 @@ export function App() {
 type Filter = "all" | "favorites" | "want" | "made";
 
 function Library({
-  recipes, collections, loading, error, updateInfo, profile, onOpenSettings, onOpen, onAdd,
+  recipes, collections, loading, error, updateInfo, profile, stagedCount, onOpenSettings, onOpen, onAdd,
 }: {
   recipes: Recipe[];
   collections: Collection[];
@@ -708,6 +767,7 @@ function Library({
   error: string | null;
   updateInfo: UpdateInfo | null;
   profile: MyProfile | null;
+  stagedCount: number;
   onOpenSettings: () => void;
   onOpen: (id: number) => void;
   onAdd: () => void;
@@ -809,6 +869,22 @@ function Library({
           </span>
           <span className="mt-0.5 block text-sm" style={{ color: "var(--dim)" }}>
             See what’s new in Settings and update when you’re ready. Nothing changes until you choose it.
+          </span>
+        </button>
+      )}
+
+      {stagedCount > 0 && (
+        <button
+          type="button"
+          onClick={onAdd}
+          className="mt-3 w-full rounded-[var(--radius)] px-4 py-3 text-left"
+          style={{ background: "var(--surface)", border: "1px solid var(--accent)" }}
+        >
+          <span className="text-sm font-bold" style={{ color: "var(--accent)" }}>
+            📧 {stagedCount} recipe{stagedCount === 1 ? "" : "s"} from your email waiting for your OK
+          </span>
+          <span className="mt-0.5 block text-sm" style={{ color: "var(--dim)" }}>
+            Muse found them in your email and set them aside for you. Nothing is saved until you check each one — tap to review them in the import inbox.
           </span>
         </button>
       )}
@@ -2797,7 +2873,170 @@ function CookMode({ recipe, onClose, onCooked }: { recipe: Recipe; onClose: () =
 
 // ---------- add a recipe: four ways in, one review screen ----------
 
-function AddRecipe({ onReview }: { onReview: (draft: NonNullable<Draft>, editingId: number | null, previewUrl: string | null) => void }) {
+// ---------- import inbox: recipes delivered from email ----------
+// Recipes Muse finds in the cook's email wait here — nothing reaches the
+// library until the cook opens one on the check-and-fix screen and saves
+// it. The app itself never reads email; Muse is the bridge, and the
+// copyable "ask" below is how the cook sets that in motion.
+
+function ImportInbox({ onReviewStaged }: { onReviewStaged: (item: StagedItem) => void }) {
+  const queryClient = useQueryClient();
+  const stagedQ = useQuery({ queryKey: ["stagedImports"], queryFn: () => api.listStagedImports({}) });
+  const items = stagedQ.data?.items ?? [];
+  const [sender, setSender] = useState("");
+  const [copied, setCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
+  const [confirmDiscard, setConfirmDiscard] = useState<number | null>(null);
+
+  const discardMut = useMutation({
+    mutationFn: (id: number) => api.discardStagedImport({ id }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["stagedImports"] });
+      setConfirmDiscard(null);
+    },
+  });
+
+  const who = sender.trim() || "[name or email address]";
+  const askPrompt = `Search my email for recipes from ${who} and add what you find to Kitchen Companion.`;
+
+  const doCopy = async () => {
+    const ok = await copyText(askPrompt);
+    if (ok) {
+      setCopied(true);
+      setCopyFailed(false);
+      window.setTimeout(() => setCopied(false), 2500);
+    } else {
+      setCopyFailed(true);
+    }
+  };
+
+  return (
+    <section className="mt-5 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="Import inbox — recipes from email">
+      <h2 className="font-display text-lg font-bold">📧 From your email — import inbox</h2>
+      <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
+        Recipes people email you don’t have to be copied in by hand. Ask your Muse to search
+        your email — for one sender, or for recipes generally — and it finds the recipe emails
+        and any attached recipe files and sets them aside here, waiting for your OK. Nothing is
+        ever saved into your library until you check it and tap save, and if one looks like a
+        recipe you already have, it is flagged so you can skip it.
+      </p>
+      <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>
+        Kitchen Companion itself never reads your email and never asks for an email password —
+        your Muse is the bridge, using your own email connection, and what it finds waits here
+        for you.
+      </p>
+
+      <div className="mt-3">
+        <label htmlFor="ask-sender" className="text-sm font-semibold">
+          Whose recipes should Muse look for? <span style={{ color: "var(--dim)" }}>(optional)</span>
+        </label>
+        <input
+          id="ask-sender"
+          type="text"
+          value={sender}
+          onChange={(e) => setSender(e.target.value)}
+          placeholder="e.g. Aunt Mary, or mary@example.com"
+          className="mt-1 w-full rounded-lg px-3 py-2.5 text-base outline-none"
+          style={{ background: "var(--surface2)", border: "1px solid var(--border)", color: "var(--text)" }}
+        />
+      </div>
+      <div className="mt-2 rounded-lg px-3 py-2.5 text-sm" style={{ background: "var(--surface2)", border: "1px dashed var(--border)" }} aria-label="What to ask Muse">
+        “{askPrompt}”
+      </div>
+      <button
+        type="button"
+        onClick={() => void doCopy()}
+        className="mt-2 w-full rounded-full py-2.5 text-sm font-semibold"
+        style={{ background: "var(--surface2)", color: "var(--text)", border: "1px solid var(--border)" }}
+      >
+        {copied ? "✓ Copied — paste it to your Muse" : "Copy what to ask Muse"}
+      </button>
+      {copyFailed && (
+        <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>
+          Copying isn’t available here — the words above are the whole message, so you can type
+          them to your Muse just as they are.
+        </p>
+      )}
+
+      <div className="mt-4">
+        <h3 className="text-sm font-bold">Waiting for your review{items.length > 0 ? ` (${items.length})` : ""}</h3>
+        {stagedQ.isPending ? (
+          <p className="mt-2 text-sm" style={{ color: "var(--dim)" }} role="status">Checking the inbox…</p>
+        ) : items.length === 0 ? (
+          <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>
+            Nothing waiting right now. When Muse finds recipes in your email, they appear here
+            for you to check — like mail in a tray, they sit here until you deal with them.
+          </p>
+        ) : (
+          <ul className="mt-2 space-y-2">
+            {items.map((item) => (
+              <li key={item.id} className="rounded-lg px-3 py-3" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
+                <p className="text-base font-semibold">{item.title}</p>
+                <p className="mt-0.5 text-sm" style={{ color: "var(--dim)" }}>
+                  From {item.senderName || item.senderEmail || "an email"}
+                  {item.senderName && item.senderEmail ? ` (${item.senderEmail})` : ""}
+                  {item.subject ? ` · “${item.subject}”` : ""}
+                  {item.emailDate ? ` · ${item.emailDate}` : ""}
+                </p>
+                {item.draft?.attachmentName && (
+                  <p className="mt-0.5 text-sm" style={{ color: "var(--dim)" }}>📎 File from the email: {item.draft.attachmentName}</p>
+                )}
+                {item.similarTitle && (
+                  <p className="mt-1 text-sm font-medium" style={{ color: "#e8a33d" }} role="status">
+                    ⚠️ Looks like “{item.similarTitle}”, which is already in your library — you may be able to skip this one.
+                  </p>
+                )}
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    disabled={!item.draft}
+                    onClick={() => onReviewStaged(item)}
+                    className="rounded-full px-4 py-2 text-sm font-semibold disabled:opacity-40"
+                    style={{ background: "var(--accent)", color: "var(--accent-ink)" }}
+                  >
+                    Check &amp; save
+                  </button>
+                  {confirmDiscard === item.id ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => discardMut.mutate(item.id)}
+                        disabled={discardMut.isPending}
+                        className="rounded-full px-4 py-2 text-sm font-semibold disabled:opacity-40"
+                        style={{ background: "var(--accent)", color: "var(--accent-ink)" }}
+                      >
+                        Yes, throw it away
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setConfirmDiscard(null)}
+                        className="rounded-full px-4 py-2 text-sm font-semibold"
+                        style={{ background: "var(--surface)", border: "1px solid var(--border)" }}
+                      >
+                        Keep it
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => setConfirmDiscard(item.id)}
+                      className="rounded-full px-4 py-2 text-sm font-semibold"
+                      style={{ background: "var(--surface)", border: "1px solid var(--border)" }}
+                    >
+                      Discard
+                    </button>
+                  )}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function AddRecipe({ onReview, onReviewStaged }: { onReview: (draft: NonNullable<Draft>, editingId: number | null, previewUrl: string | null) => void; onReviewStaged: (item: StagedItem) => void }) {
   const [url, setUrl] = useState("");
   const [pasteText, setPasteText] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
@@ -2942,7 +3181,9 @@ function AddRecipe({ onReview }: { onReview: (draft: NonNullable<Draft>, editing
       )}
       {busy && <p className="mt-4 text-sm font-medium" style={{ color: "var(--herb)" }} role="status">{busy}</p>}
 
-      <section className="mt-5 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="Save from a link">
+      <ImportInbox onReviewStaged={onReviewStaged} />
+
+      <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="Save from a link">
         <h2 className="font-display text-lg font-bold">🔗 Save from a link</h2>
         <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
           Paste a link to a recipe blog — or a Pinterest pin, and we’ll follow it to the recipe
@@ -3071,11 +3312,14 @@ function AddRecipe({ onReview }: { onReview: (draft: NonNullable<Draft>, editing
 // ---------- check-and-fix review form ----------
 
 function ReviewForm({
-  draft, editingId, previewUrl, collections, recipes, onDone, onCancel,
+  draft, editingId, previewUrl, stagedId, sourceNote, rawText, collections, recipes, onDone, onCancel,
 }: {
   draft: NonNullable<Draft>;
   editingId: number | null;
   previewUrl: string | null;
+  stagedId: number | null;
+  sourceNote: string | null;
+  rawText: string | null;
   collections: Collection[];
   recipes: Recipe[];
   onDone: (recipeId: number | null) => void;
@@ -3152,13 +3396,31 @@ function ReviewForm({
         return editingId;
       }
       const created = await api.createRecipe(payload);
+      // Saved from the import inbox: the staged copy has done its job.
+      if (stagedId != null) {
+        try {
+          await api.discardStagedImport({ id: stagedId });
+        } catch {
+          /* the recipe saved; the waiting copy can be discarded in the inbox */
+        }
+      }
       return created.id;
     },
     onSuccess: (id) => {
       queryClient.invalidateQueries({ queryKey: ["recipes"] });
+      if (stagedId != null) queryClient.invalidateQueries({ queryKey: ["stagedImports"] });
       onDone(id);
     },
     onError: () => setError("That recipe could not be saved. Your words are still here — try again."),
+  });
+
+  const discardStagedMut = useMutation({
+    mutationFn: () => api.discardStagedImport({ id: stagedId ?? 0 }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["stagedImports"] });
+      onCancel();
+    },
+    onError: () => setError("That one could not be discarded just now. You can throw it away from the import inbox instead."),
   });
 
   useEffect(() => {
@@ -3167,10 +3429,14 @@ function ReviewForm({
   }, [editingId]);
 
   useEffect(() => {
-    const t = title.trim().toLowerCase();
+    const t = title.trim();
     if (!t || editingId != null) { setDupWarning(null); return; }
-    const dup = recipes.find((r) => r.title.trim().toLowerCase() === t);
-    setDupWarning(dup ? `Heads up: you already have a recipe called “${dup.title}”. Saving will keep both.` : null);
+    const dup = recipes.find((r) => titlesSimilar(r.title, t));
+    setDupWarning(
+      dup
+        ? `Heads up: this looks like “${dup.title}”, which is already in your library. If it’s the same recipe, go back and discard this one — or save anyway and keep both.`
+        : null,
+    );
   }, [title, recipes, editingId]);
 
   const inputCls = "w-full rounded-lg px-3 py-2.5 text-base outline-none";
@@ -3185,6 +3451,18 @@ function ReviewForm({
           ? "Make it yours — fix quantities, add your own notes."
           : "Here’s what was read in. Fix anything that looks wrong, then save — nothing is kept until you do."}
       </p>
+
+      {sourceNote && (
+        <p className="mt-3 rounded-[var(--radius)] px-4 py-3 text-sm" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} role="status">
+          {sourceNote}
+        </p>
+      )}
+      {rawText && (
+        <details className="mt-3 rounded-[var(--radius)] px-4 py-3" style={{ background: "var(--surface)", border: "1px solid var(--border)" }}>
+          <summary className="cursor-pointer text-sm font-semibold">✉️ Read the original email</summary>
+          <p className="mt-2 whitespace-pre-wrap text-sm" style={{ color: "var(--dim)" }}>{rawText}</p>
+        </details>
+      )}
 
       {scanPreview && (
         <figure className="mt-4">
@@ -3339,6 +3617,17 @@ function ReviewForm({
       >
         {saveMut.isPending ? "Saving…" : editingId != null ? "Save changes" : "Save this recipe"}
       </button>
+      {stagedId != null && (
+        <button
+          type="button"
+          disabled={discardStagedMut.isPending}
+          onClick={() => discardStagedMut.mutate()}
+          className="mt-3 w-full rounded-full py-3 text-base font-semibold disabled:opacity-40"
+          style={{ background: "var(--surface)", border: "1px solid var(--border)", color: "var(--text)" }}
+        >
+          {discardStagedMut.isPending ? "Discarding…" : "Don’t save this — discard it"}
+        </button>
+      )}
     </div>
   );
 }
@@ -3682,6 +3971,24 @@ function SettingsView({
             Last checked {fmtDateTime(updateInfo.checkedAt)} · new versions are published at github.com/aruikis/Kitchen-Companion
           </p>
         )}
+
+        <h3 className="mt-5 text-base font-bold">📖 What’s new — the change log</h3>
+        <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
+          Everything each update brought, in plain words — newest first.
+        </p>
+        <div className="mt-3 space-y-4">
+          {CHANGELOG.map((v) => (
+            <div key={v.version}>
+              <p className="text-sm font-bold">
+                Version {v.version} · {prettyDate(v.date)}
+                {v.version === APP_VERSION ? <span className="font-normal" style={{ color: "var(--herb)" }}> — the one you’re using</span> : null}
+              </p>
+              <ul className="mt-1 list-disc space-y-1 pl-5 text-sm" style={{ color: "var(--dim)" }}>
+                {v.notes.map((n) => <li key={n}>{n}</li>)}
+              </ul>
+            </div>
+          ))}
+        </div>
       </section>
 
       <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="Backup and safety">
@@ -3719,26 +4026,14 @@ function SettingsView({
         )}
       </section>
 
-      <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="About and version history">
+      <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="About">
         <h2 className="font-display text-xl font-bold">About</h2>
         <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
           Kitchen Companion UAT · Version {APP_VERSION}. Your recipes live in this app, in your own
           Muse account. They are backed up automatically inside the app, and you can download a
           complete backup — recipes and photos together — any time from the bottom of the Recipes tab.
+          What each version brought is in the change log under App updates, just above.
         </p>
-        <h3 className="mt-3 text-sm font-bold">Version history</h3>
-        <div className="mt-1 space-y-2">
-          {CHANGELOG.map((v) => (
-            <details key={v.version} className="rounded-lg px-3 py-2" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
-              <summary className="cursor-pointer text-sm font-semibold">
-                Version {v.version} · {prettyDate(v.date)}{v.version === APP_VERSION ? " (this one)" : ""}
-              </summary>
-              <ul className="mt-1 list-disc space-y-1 pl-5 text-sm" style={{ color: "var(--dim)" }}>
-                {v.notes.map((n) => <li key={n}>{n}</li>)}
-              </ul>
-            </details>
-          ))}
-        </div>
       </section>
     </div>
   );

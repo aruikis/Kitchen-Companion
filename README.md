@@ -1,45 +1,27 @@
-# Kitchen Companion (UAT) — v1.4.0
+# Kitchen Companion (UAT) — v1.5.0
 
 A recipe app built as a Muse space (TypeScript). Save recipes from a link or
-Pinterest pin, scan a cookbook page, upload a file, or type one in — every
-import lands on a check-and-fix screen first. Recipe pages carry a photo of
-the finished dish, a serving scaler, a week planner that builds a shopping
-list, easy sharing, and an optional Jewel-Osco shopping action (it hands the
-list to Jewel's own website; you sign in and pay there — no password ever
-goes into this app, and there is no Jewel API or Instacart involved).
+Pinterest pin, scan a cookbook page, upload a file, bring them in from your
+email through your own Muse, or type one in — every import lands on a
+check-and-fix screen first. Recipe pages carry a photo of the finished dish, a
+serving scaler, a week planner that builds a shopping list, friends and
+sharing, and an optional Jewel-Osco shopping action (it hands the list to
+Jewel's own website; you sign in and pay there — no password ever goes into
+this app, and there is no Jewel API or Instacart involved).
 
 Two example recipes come in the box — sausage and sauerkraut with mashed
 potatoes (kielbasa & sauerkraut served over buttery mashed potatoes) and a
 top-rated homemade lasagna. They are loaded by the app's own `seedExamples`
-action, which imports them live from their source pages; no database is
-included in this repo, so a fresh install starts empty apart from those
-examples.
+action; no database is included in this repo, so a fresh install starts empty
+apart from those examples.
 
-## What's new in v1.4.0
+## What's new in v1.5.0
 
-- Welcome and your own Kitchen Companion code: the first time you open the
-  app you create a username and are given your own code (KC-XXXX-XXXX),
-  like a member number. A short, simple tutorial follows, and you can
-  re-open it any time from Settings ("Show the tutorial again").
-- Friends: add friends by their code and share recipes and whole
-  collections with them inside the app. Only what you choose to share is
-  visible to friends; your private library stays private. (Friends switch
-  fully on once the owner's one-time server setup is done; until then the
-  app says so plainly and keeps your shares safe to send automatically.)
-- Your profile lives in Settings, with your username, your code, and a
-  private backup key that protects your server backup — never share that
-  key; your friend code is the one you give out.
-
-## What's new in v1.3.0
-
-- Backups now include everything: the Download backup file carries your
-  recipes AND every photo and attachment, and restoring brings them all
-  back (proven by a save, delete, restore test). Older text-only backup
-  files still restore.
-- The app also keeps automatic backup snapshots inside the app, and the
-  backup panel honestly says what is protected, including a "Last backed
-  up" status. An optional server copy can be switched on in the panel
-  once the owner's one-time server setup is done.
+- Recipes can come in from your email: ask your Muse to search your email
+  for recipes from a sender, and what it finds waits in the import inbox for
+  your review — nothing is saved until you approve it.
+- A simple change log: Settings → App updates now ends with "What's new —
+  the change log", a short plain-language list of what each update brought.
 
 ## Installing (for your Muse)
 

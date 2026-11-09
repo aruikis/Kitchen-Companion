@@ -134,6 +134,29 @@ export const localShares = sqliteTable("local_shares", {
     .$defaultFn(() => new Date()),
 });
 
+// Recipes delivered from email by the user's own Muse, waiting for the
+// cook's review (v1.5.0). The app itself never reads email — Muse is the
+// bridge, searching the user's own connected mailbox and staging what it
+// finds here through the stageEmailImport action. `draft` is the full
+// import draft (same shape the check-and-fix screen edits) as JSON, so a
+// staged item opens straight onto the existing review screen; nothing
+// reaches the recipes table until the cook approves it there. The email's
+// own words are kept in `rawText` and any attached file is kept as a blob
+// referenced inside the draft, exactly like the other import paths.
+export const stagedImports = sqliteTable("staged_imports", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  title: text("title").notNull(),
+  draft: text("draft").notNull().default("{}"),
+  senderName: text("sender_name").notNull().default(""),
+  senderEmail: text("sender_email").notNull().default(""),
+  subject: text("subject").notNull().default(""),
+  emailDate: text("email_date"),
+  rawText: text("raw_text"),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
 export const groceryItems = sqliteTable("grocery_items", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   name: text("name").notNull(),
