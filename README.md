@@ -1,4 +1,4 @@
-# Kitchen Companion (UAT) — v1.2.0
+# Kitchen Companion (UAT) — v1.4.0
 
 A recipe app built as a Muse space (TypeScript). Save recipes from a link or
 Pinterest pin, scan a cookbook page, upload a file, or type one in — every
@@ -15,20 +15,31 @@ action, which imports them live from their source pages; no database is
 included in this repo, so a fresh install starts empty apart from those
 examples.
 
-## What's new in v1.2.0
+## What's new in v1.4.0
 
-- Photos straighten themselves: a photo uploaded or scanned upside down or
-  sideways is rotated right-side up automatically.
-- The Jewel-Osco shopping handoff is fixed: the list builds at the servings
-  shown, copying works in the app (with the list shown on screen as a backup),
-  and the link goes to Jewel's own site over https — you sign in and pay
-  there, as always.
-- Recipes categorize themselves: course (appetizers, main dishes, desserts),
-  protein/type (poultry, beef, pork, vegetarian), and time (under 30 minutes
-  and up) are filled in automatically and can be corrected on the recipe.
-- Settings now has App updates: it shows your version, checks this repo for a
-  newer one, and shows What's new before you decide — nothing updates until
-  you choose.
+- Welcome and your own Kitchen Companion code: the first time you open the
+  app you create a username and are given your own code (KC-XXXX-XXXX),
+  like a member number. A short, simple tutorial follows, and you can
+  re-open it any time from Settings ("Show the tutorial again").
+- Friends: add friends by their code and share recipes and whole
+  collections with them inside the app. Only what you choose to share is
+  visible to friends; your private library stays private. (Friends switch
+  fully on once the owner's one-time server setup is done; until then the
+  app says so plainly and keeps your shares safe to send automatically.)
+- Your profile lives in Settings, with your username, your code, and a
+  private backup key that protects your server backup — never share that
+  key; your friend code is the one you give out.
+
+## What's new in v1.3.0
+
+- Backups now include everything: the Download backup file carries your
+  recipes AND every photo and attachment, and restoring brings them all
+  back (proven by a save, delete, restore test). Older text-only backup
+  files still restore.
+- The app also keeps automatic backup snapshots inside the app, and the
+  backup panel honestly says what is protected, including a "Last backed
+  up" status. An optional server copy can be switched on in the panel
+  once the owner's one-time server setup is done.
 
 ## Installing (for your Muse)
 

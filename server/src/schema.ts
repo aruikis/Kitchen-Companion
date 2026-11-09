@@ -38,6 +38,10 @@ export const recipes = sqliteTable("recipes", {
   scanPhotoKey: text("scan_photo_key"),
   sourcePhotoKey: text("source_photo_key"),
   attachmentName: text("attachment_name"),
+  // Blob key of the attached original file (e.g. an uploaded PDF). Until
+  // v1.3.0 only the file's NAME was kept and the stored bytes were orphaned
+  // — unrecoverable. The key makes the original reachable and backable-up.
+  attachmentKey: text("attachment_key"),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
@@ -75,6 +79,56 @@ export const jewelOrders = sqliteTable("jewel_orders", {
   items: text("items").notNull().default("[]"),
   itemIds: text("item_ids").notNull().default("[]"),
   status: text("status", { enum: ["built", "sent"] }).notNull().default("built"),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+// The cook's own profile (v1.4.0): created in the forced first-run welcome
+// flow. One row per installed copy — this copy's identity. The username and
+// KC-ID (KC-XXXX-XXXX) are registered on the shared Kitchen Companion
+// backend (Supabase, the same project Vault X uses) when its kc_* tables
+// are live, so friends on other copies can find this user by code.
+// photoData is a small base64 copy of the profile photo kept for backend
+// sync; the full photo lives in blob storage under photoKey.
+export const profiles = sqliteTable("profiles", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  username: text("username").notNull(),
+  displayName: text("display_name").notNull().default(""),
+  kcId: text("kc_id").notNull(),
+  photoKey: text("photo_key"),
+  photoData: text("photo_data"),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+// Cache of this user's friends (the live list is on the backend; this
+// cache lets the Friends tab render what it last saw when offline).
+export const localFriends = sqliteTable("local_friends", {
+  kcId: text("kc_id").primaryKey(),
+  username: text("username").notNull(),
+  displayName: text("display_name").notNull().default(""),
+  photoData: text("photo_data"),
+  addedAt: integer("added_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+// Recipes/collections this user has chosen to share with friends. The
+// payload is the same import format a backup uses (photos embedded), so a
+// friend saving it gets the whole recipe. `synced` flips to 1 once the
+// share is pushed to the backend; unsynced shares are pushed on app open.
+export const localShares = sqliteTable("local_shares", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  shareKey: text("share_key").notNull(),
+  kind: text("kind", { enum: ["recipe", "collection"] }).notNull(),
+  title: text("title").notNull(),
+  payload: text("payload").notNull().default("{}"),
+  synced: integer("synced").notNull().default(0),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),

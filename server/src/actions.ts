@@ -27,6 +27,7 @@ const draftShape = {
   scanPhotoKey: z.string().nullable().default(null),
   sourcePhotoKey: z.string().nullable().default(null),
   attachmentName: z.string().nullable().default(null),
+  attachmentKey: z.string().nullable().default(null),
 };
 
 const recipeDto = z.object({
@@ -58,6 +59,8 @@ const recipeDto = z.object({
   scanPhotoUrl: z.string().nullable(),
   sourcePhotoUrl: z.string().nullable(),
   attachmentName: z.string().nullable(),
+  attachmentKey: z.string().nullable(),
+  attachmentUrl: z.string().nullable(),
   createdAt: z.string(),
 });
 
@@ -80,6 +83,40 @@ async function safePhotoUrl(ctx: Ctx, key: string | null): Promise<string | null
   if (!key) return null;
   try {
     return await ctx.blobs.getUrl(key);
+  } catch {
+    return null;
+  }
+}
+
+// ---------- backup: photos and files travel WITH the recipes ----------
+// Backup format v1 (up to v1.2.0) exported recipe TEXT only — the photos
+// were left behind in blob storage, so a restore brought back recipes with
+// no pictures. That is the gap Anthony flagged ("those cannot be lost
+// ever"). Format v2 embeds every photo/file a recipe owns — finished-dish
+// photo, scanned page, source photo, attached original — as base64 inside
+// the backup itself, and restore writes them back into blob storage.
+// Verified live in the sandbox (Nov 9, 2026): ctx.blobs has no byte-read
+// and its URLs are app-relative, so the server cannot fetch photo bytes
+// back — the CLIENT assembles backups (it can fetch the photo URLs in the
+// browser) and hands the complete payload to the server for download or
+// for storing as an automatic snapshot. A photo the client cannot fetch
+// is counted (photosUnreadable) and reported, never silently dropped.
+
+const photoAsset = z.object({ mimeType: z.string(), dataBase64: z.string() });
+type PhotoAsset = z.infer<typeof photoAsset>;
+
+async function storeBlobAsset(
+  ctx: Ctx,
+  asset: PhotoAsset | null | undefined,
+  prefix: string,
+): Promise<string | null> {
+  if (!asset) return null;
+  try {
+    const bytes = Uint8Array.from(atob(asset.dataBase64), (c) => c.charCodeAt(0));
+    if (bytes.length === 0 || bytes.length > 12_000_000) return null;
+    const key = `${prefix}/${crypto.randomUUID()}`;
+    await ctx.blobs.put(key, bytes, { contentType: asset.mimeType });
+    return key;
   } catch {
     return null;
   }
@@ -195,10 +232,11 @@ async function autoCategorize(
 }
 
 async function toDto(ctx: Ctx, row: RecipeRow): Promise<z.infer<typeof recipeDto>> {
-  const [dishPhotoUrl, scanPhotoUrl, sourcePhotoUrl] = await Promise.all([
+  const [dishPhotoUrl, scanPhotoUrl, sourcePhotoUrl, attachmentUrl] = await Promise.all([
     safePhotoUrl(ctx, row.dishPhotoKey),
     safePhotoUrl(ctx, row.scanPhotoKey),
     safePhotoUrl(ctx, row.sourcePhotoKey),
+    safePhotoUrl(ctx, row.attachmentKey),
   ]);
   return {
     id: row.id,
@@ -229,6 +267,8 @@ async function toDto(ctx: Ctx, row: RecipeRow): Promise<z.infer<typeof recipeDto
     scanPhotoUrl,
     sourcePhotoUrl,
     attachmentName: row.attachmentName,
+    attachmentKey: row.attachmentKey,
+    attachmentUrl,
     createdAt: row.createdAt.toISOString(),
   };
 }
@@ -605,6 +645,208 @@ async function getSetting(ctx: Ctx, key: string, fallback: string): Promise<stri
   return value ? value : fallback;
 }
 
+async function setSetting(ctx: Ctx, key: string, value: string): Promise<void> {
+  const db = ctx.db<typeof schema>();
+  await db.insert(schema.appSettings)
+    .values({ key, value })
+    .onConflictDoUpdate({ target: schema.appSettings.key, set: { value } });
+}
+
+// ---------- full-fidelity backup payload (format v2) ----------
+// exportLibrary produces the recipe/collection text; the client overlays
+// each recipe's photos/files (fetched in the browser, embedded as data)
+// to complete the payload. The same completed payload is what gets
+// downloaded as the backup file and what saveAutoBackup stores as an
+// automatic snapshot, so both copies are identical in content.
+
+const backupRecipeShape = {
+  id: z.number(),
+  title: z.string(),
+  description: z.string(),
+  servings: z.number().nullable(),
+  prepMinutes: z.number().nullable(),
+  cookMinutes: z.number().nullable(),
+  ingredients: z.array(z.string()),
+  steps: z.array(z.string()),
+  tags: z.array(z.string()),
+  course: z.string().nullable(),
+  protein: z.string().nullable(),
+  sourceUrl: z.string().nullable(),
+  sourceName: z.string().nullable(),
+  collectionName: z.string().nullable(),
+  favorite: z.boolean(),
+  rating: z.number().nullable(),
+  status: z.enum(["want", "made"]),
+  cookCount: z.number(),
+  lastCookedAt: z.string().nullable(),
+  notes: z.string(),
+  attachmentName: z.string().nullable(),
+  dishPhoto: photoAsset.nullable(),
+  scanPhoto: photoAsset.nullable(),
+  sourcePhoto: photoAsset.nullable(),
+  attachment: photoAsset.nullable(),
+};
+
+const backupPayloadSchema = z.object({
+  version: z.number(),
+  exportedAt: z.string(),
+  photosUnreadable: z.number(),
+  collections: z.array(z.object({ id: z.number(), name: z.string() })),
+  recipes: z.array(z.object(backupRecipeShape)),
+});
+type BackupPayload = z.infer<typeof backupPayloadSchema>;
+
+async function buildBackupPayload(ctx: Ctx): Promise<BackupPayload> {
+  const db = ctx.db<typeof schema>();
+  const collRows = await db.select().from(schema.collections).orderBy(asc(schema.collections.id));
+  const collNames = new Map(collRows.map((c) => [c.id, c.name]));
+  const rows = await db.select().from(schema.recipes).orderBy(asc(schema.recipes.id));
+  const recipes: BackupPayload["recipes"] = [];
+  for (const r of rows) {
+    recipes.push({
+      id: r.id,
+      title: r.title,
+      description: r.description,
+      servings: r.servings,
+      prepMinutes: r.prepMinutes,
+      cookMinutes: r.cookMinutes,
+      ingredients: parseJsonArray(r.ingredients),
+      steps: parseJsonArray(r.steps),
+      tags: parseJsonArray(r.tags),
+      course: r.course,
+      protein: r.protein,
+      sourceUrl: r.sourceUrl,
+      sourceName: r.sourceName,
+      collectionName: r.collectionId != null ? (collNames.get(r.collectionId) ?? null) : null,
+      favorite: r.favorite === 1,
+      rating: r.rating,
+      status: r.status,
+      cookCount: r.cookCount,
+      lastCookedAt: r.lastCookedAt,
+      notes: r.notes,
+      attachmentName: r.attachmentName,
+      // Photo/file data is overlaid by the client, which is the side that
+      // can fetch the bytes (see the backup note above).
+      dishPhoto: null,
+      scanPhoto: null,
+      sourcePhoto: null,
+      attachment: null,
+    });
+  }
+  return {
+    version: 2,
+    exportedAt: new Date().toISOString(),
+    photosUnreadable: 0,
+    collections: collRows.map((c) => ({ id: c.id, name: c.name })),
+    recipes,
+  };
+}
+
+function countImportPhotos(recipes: ImportRecipe[]): number {
+  return recipes.reduce(
+    (n, r) => n + [r.dishPhoto, r.scanPhoto, r.sourcePhoto, r.attachment].filter(Boolean).length,
+    0,
+  );
+}
+
+// The import side, shared by "Restore from backup" (a file the user kept)
+// and "Restore from automatic backup" (the newest in-app snapshot). Old
+// format-v1 files carry no photos; their photo fields arrive as null and
+// restore as photoless recipes, exactly as before.
+const importRecipeSchema = z.object({
+  title: z.string().min(1),
+  description: z.string().default(""),
+  servings: z.number().int().positive().nullable().default(null),
+  prepMinutes: z.number().int().nonnegative().nullable().default(null),
+  cookMinutes: z.number().int().nonnegative().nullable().default(null),
+  ingredients: z.array(z.string()).default([]),
+  steps: z.array(z.string()).default([]),
+  tags: z.array(z.string()).default([]),
+  course: z.string().nullable().default(null),
+  protein: z.string().nullable().default(null),
+  sourceUrl: z.string().nullable().default(null),
+  sourceName: z.string().nullable().default(null),
+  collectionName: z.string().nullable().default(null),
+  favorite: z.boolean().default(false),
+  rating: z.number().int().min(1).max(5).nullable().default(null),
+  status: z.enum(["want", "made"]).default("want"),
+  cookCount: z.number().int().nonnegative().default(0),
+  lastCookedAt: z.string().nullable().default(null),
+  notes: z.string().default(""),
+  attachmentName: z.string().nullable().default(null),
+  dishPhoto: photoAsset.nullable().default(null),
+  scanPhoto: photoAsset.nullable().default(null),
+  sourcePhoto: photoAsset.nullable().default(null),
+  attachment: photoAsset.nullable().default(null),
+});
+type ImportRecipe = z.infer<typeof importRecipeSchema>;
+
+async function importLibraryData(
+  ctx: Ctx,
+  data: { collections: Array<{ name: string }>; recipes: ImportRecipe[] },
+): Promise<{ imported: number; skipped: number; photosRestored: number }> {
+  const db = ctx.db<typeof schema>();
+  const existingColls = await db.select().from(schema.collections);
+  const collIdByName = new Map(existingColls.map((c) => [c.name.toLowerCase(), c.id]));
+  for (const c of data.collections) {
+    const key = c.name.trim().toLowerCase();
+    if (!key || collIdByName.has(key)) continue;
+    const inserted = await db.insert(schema.collections)
+      .values({ name: c.name.trim() })
+      .returning({ id: schema.collections.id });
+    const row = inserted[0];
+    if (row) collIdByName.set(key, row.id);
+  }
+  const existingTitles = new Set(
+    (await db.select({ title: schema.recipes.title }).from(schema.recipes))
+      .map((r) => r.title.trim().toLowerCase()),
+  );
+  let imported = 0;
+  let skipped = 0;
+  let photosRestored = 0;
+  for (const r of data.recipes) {
+    const titleKey = r.title.trim().toLowerCase();
+    if (existingTitles.has(titleKey)) { skipped++; continue; }
+    existingTitles.add(titleKey);
+    const cats = keywordCategories(r.title, r.ingredients);
+    const [dishPhotoKey, scanPhotoKey, sourcePhotoKey, attachmentKey] = await Promise.all([
+      storeBlobAsset(ctx, r.dishPhoto, "dish"),
+      storeBlobAsset(ctx, r.scanPhoto, "scan"),
+      storeBlobAsset(ctx, r.sourcePhoto, "src"),
+      storeBlobAsset(ctx, r.attachment, "file"),
+    ]);
+    photosRestored += [dishPhotoKey, scanPhotoKey, sourcePhotoKey, attachmentKey].filter(Boolean).length;
+    await db.insert(schema.recipes).values({
+      title: r.title.trim(),
+      description: r.description,
+      servings: r.servings,
+      prepMinutes: r.prepMinutes,
+      cookMinutes: r.cookMinutes,
+      ingredients: JSON.stringify(r.ingredients),
+      steps: JSON.stringify(r.steps),
+      tags: JSON.stringify(r.tags.map((t) => t.toLowerCase())),
+      course: asCourse(r.course) ?? cats.course,
+      protein: asProtein(r.protein) ?? cats.protein,
+      sourceUrl: r.sourceUrl,
+      sourceName: r.sourceName,
+      collectionId: r.collectionName ? (collIdByName.get(r.collectionName.trim().toLowerCase()) ?? null) : null,
+      favorite: r.favorite ? 1 : 0,
+      rating: r.rating,
+      status: r.status,
+      cookCount: r.cookCount,
+      lastCookedAt: r.lastCookedAt,
+      notes: r.notes,
+      dishPhotoKey,
+      scanPhotoKey,
+      sourcePhotoKey,
+      attachmentName: r.attachmentName,
+      attachmentKey,
+    });
+    imported++;
+  }
+  return { imported, skipped, photosRestored };
+}
+
 // Some source pages pack every step into one string with the numbering
 // embedded ("...undrained2. After washing..."). For the seeded examples,
 // split those back into individual steps and drop the printed numbers —
@@ -711,6 +953,7 @@ async function draftFromUrl(ctx: Ctx, url: string): Promise<DraftResponse> {
         sourcePhotoKey,
         scanPhotoKey: null,
         attachmentName: null,
+        attachmentKey: null,
       },
     };
   }
@@ -742,11 +985,196 @@ async function draftFromUrl(ctx: Ctx, url: string): Promise<DraftResponse> {
         sourcePhotoKey: null,
         scanPhotoKey: null,
         attachmentName: null,
+        attachmentKey: null,
       },
     };
   } catch {
     return emptyDraftError("The recipe on that page could not be read automatically. Try pasting the recipe text instead.");
   }
+}
+
+// ---------- shared backend: profiles, friends, sharing, server backup ----------
+// Kitchen Companion's shared features live on the same Supabase project
+// Vault X uses (Anthony's project, created Nov 2, 2026) — project URL and
+// PUBLISHABLE key below. A publishable key is designed to be embedded in
+// apps (Vault X's ships in its public repo the same way); the project's
+// secret key is never used or stored here. The kc_* tables are created by
+// ONE one-time step in the Supabase SQL editor (see BACKEND-SETUP.md in
+// this repo for the exact SQL). Until that step is done, backend calls
+// answer 404 (PostgREST PGRST205, "table not in schema cache") and every
+// action below reports friendsOnline: false — the app says so in plain
+// words and everything local (profile, code, welcome flow, local backup)
+// keeps working. Once the tables exist, the same actions light up with
+// no app update needed.
+
+const KC_BACKEND_URL = "https://iilsbousebrgkmsimucq.supabase.co";
+const KC_PUBLISHABLE_KEY = "sb_publishable_Qi1YZXJNCbiDSTs0pn3fQA_MKai5qNX";
+
+type KcResult<T> = { ok: true; data: T } | { ok: false; status: number };
+
+async function kcFetch<T>(path: string, init?: RequestInit): Promise<KcResult<T>> {
+  try {
+    const res = await fetch(`${KC_BACKEND_URL}/rest/v1/${path}`, {
+      ...init,
+      headers: {
+        apikey: KC_PUBLISHABLE_KEY,
+        Authorization: `Bearer ${KC_PUBLISHABLE_KEY}`,
+        "Content-Type": "application/json",
+        ...(init?.headers ?? {}),
+      },
+    });
+    if (!res.ok) {
+      await res.text().catch(() => "");
+      return { ok: false, status: res.status };
+    }
+    const text = await res.text();
+    let data: T;
+    try {
+      data = (text ? JSON.parse(text) : null) as T;
+    } catch {
+      data = null as T;
+    }
+    return { ok: true, data };
+  } catch {
+    return { ok: false, status: 0 };
+  }
+}
+
+async function kcFriendsOnline(): Promise<boolean> {
+  const r = await kcFetch<unknown[]>("kc_profiles?select=kc_id&limit=1");
+  return r.ok;
+}
+
+type KcProfileRow = { kc_id: string; username: string; display_name: string; photo_data: string | null };
+
+async function kcGetProfileById(kcId: string): Promise<KcProfileRow | null> {
+  const r = await kcFetch<KcProfileRow[]>(
+    `kc_profiles?select=kc_id,username,display_name,photo_data&kc_id=eq.${encodeURIComponent(kcId)}&limit=1`,
+  );
+  return r.ok ? (r.data[0] ?? null) : null;
+}
+
+async function kcGetProfileByUsername(username: string): Promise<KcProfileRow | null> {
+  const r = await kcFetch<KcProfileRow[]>(
+    `kc_profiles?select=kc_id,username,display_name,photo_data&username=ilike.${encodeURIComponent(username)}&limit=1`,
+  );
+  return r.ok ? (r.data[0] ?? null) : null;
+}
+
+async function kcUpsertProfile(p: { kcId: string; username: string; displayName: string; photoData: string | null }): Promise<boolean> {
+  const r = await kcFetch<unknown>("kc_profiles?on_conflict=kc_id", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify({ kc_id: p.kcId, username: p.username, display_name: p.displayName, photo_data: p.photoData }),
+  });
+  return r.ok;
+}
+
+// ---------- local profile ----------
+
+type LocalProfileRow = typeof schema.profiles.$inferSelect;
+
+async function getLocalProfile(ctx: Ctx): Promise<LocalProfileRow | null> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db.select().from(schema.profiles).orderBy(asc(schema.profiles.id)).limit(1);
+  return rows[0] ?? null;
+}
+
+const KC_ID_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+
+function newKcId(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(8));
+  let out = "";
+  for (let i = 0; i < 8; i++) {
+    out += KC_ID_ALPHABET[(bytes[i] ?? 0) % KC_ID_ALPHABET.length] ?? "A";
+  }
+  return `KC-${out.slice(0, 4)}-${out.slice(4)}`;
+}
+
+const USERNAME_RE = /^[A-Za-z0-9_]{3,20}$/;
+const USERNAME_ERROR = "Usernames are 3 to 20 characters — letters, numbers, and underscores only.";
+
+// The private backup key: a high-entropy secret issued with the profile,
+// SEPARATE from the public Kitchen Companion code (the code is for
+// friends to see; this key is not). Only its SHA-256 hash ever goes to
+// the shared backend, stamped on the user's kc_backups row; restoring a
+// server backup requires presenting the key itself. The key lives only
+// in this copy's own settings and is shown to the owner in the app.
+async function getOrCreateRecoveryKey(ctx: Ctx): Promise<string> {
+  const existing = await getSetting(ctx, "recovery_key", "");
+  if (existing) return existing;
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  let raw = "";
+  for (let i = 0; i < 16; i++) {
+    raw += KC_ID_ALPHABET[(bytes[i] ?? 0) % KC_ID_ALPHABET.length] ?? "A";
+  }
+  const key = `${raw.slice(0, 4)}-${raw.slice(4, 8)}-${raw.slice(8, 12)}-${raw.slice(12)}`;
+  await setSetting(ctx, "recovery_key", key);
+  return key;
+}
+
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+const profileDto = z.object({
+  username: z.string(),
+  displayName: z.string(),
+  kcId: z.string(),
+  photoUrl: z.string().nullable(),
+  photoData: z.string().nullable(),
+  createdAt: z.string(),
+});
+
+async function profileToDto(ctx: Ctx, row: LocalProfileRow): Promise<z.infer<typeof profileDto>> {
+  return {
+    username: row.username,
+    displayName: row.displayName,
+    kcId: row.kcId,
+    photoUrl: await safePhotoUrl(ctx, row.photoKey),
+    photoData: row.photoData,
+    createdAt: row.createdAt.toISOString(),
+  };
+}
+
+async function syncProfileToBackend(ctx: Ctx): Promise<boolean> {
+  const me = await getLocalProfile(ctx);
+  if (!me) return false;
+  const ok = await kcUpsertProfile({
+    kcId: me.kcId,
+    username: me.username,
+    displayName: me.displayName,
+    photoData: me.photoData,
+  });
+  await setSetting(ctx, "profile_backend_synced", ok ? "1" : "0");
+  return ok;
+}
+
+async function pushPendingShares(ctx: Ctx): Promise<number> {
+  const me = await getLocalProfile(ctx);
+  if (!me) return 0;
+  const db = ctx.db<typeof schema>();
+  const pending = await db.select().from(schema.localShares).where(eq(schema.localShares.synced, 0));
+  let pushed = 0;
+  for (const s of pending) {
+    let payload: unknown = {};
+    try {
+      payload = JSON.parse(s.payload);
+    } catch {
+      payload = {};
+    }
+    const r = await kcFetch<unknown>("kc_shares?on_conflict=share_key", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify({ share_key: s.shareKey, owner_kc_id: me.kcId, kind: s.kind, title: s.title, payload }),
+    });
+    if (r.ok) {
+      await db.update(schema.localShares).set({ synced: 1 }).where(eq(schema.localShares.id, s.id));
+      pushed++;
+    }
+  }
+  return pushed;
 }
 
 // ---------- actions ----------
@@ -771,6 +1199,7 @@ const draftResponse = z.object({
     sourcePhotoKey: z.string().nullable(),
     scanPhotoKey: z.string().nullable(),
     attachmentName: z.string().nullable(),
+    attachmentKey: z.string().nullable(),
   }).nullable(),
 });
 type DraftResponse = z.infer<typeof draftResponse>;
@@ -830,6 +1259,7 @@ export const Actions = {
         scanPhotoKey: args.scanPhotoKey,
         sourcePhotoKey: args.sourcePhotoKey,
         attachmentName: args.attachmentName,
+        attachmentKey: args.attachmentKey,
       }).returning({ id: schema.recipes.id });
       const row = inserted[0];
       if (!row) throw new Error("createRecipe: no row returned");
@@ -881,6 +1311,7 @@ export const Actions = {
         scanPhotoKey: args.scanPhotoKey,
         sourcePhotoKey: args.sourcePhotoKey,
         attachmentName: args.attachmentName,
+        attachmentKey: args.attachmentKey,
         updatedAt: new Date(),
       }).where(eq(schema.recipes.id, args.id));
       ctx.invalidateQueries();
@@ -1098,6 +1529,7 @@ export const Actions = {
             sourcePhotoKey: null,
             scanPhotoKey: null,
             attachmentName: null,
+            attachmentKey: null,
           },
         };
       } catch {
@@ -1137,6 +1569,7 @@ export const Actions = {
             sourcePhotoKey: null,
             scanPhotoKey: key,
             attachmentName: null,
+            attachmentKey: null,
           },
         };
       } catch {
@@ -1160,6 +1593,7 @@ export const Actions = {
             sourcePhotoKey: null,
             scanPhotoKey: key,
             attachmentName: null,
+            attachmentKey: null,
           },
         };
       }
@@ -1398,144 +1832,718 @@ export const Actions = {
   }),
 
   exportLibrary: defineAction({
-    description: "Exports the whole library (recipes and collections) as structured data the user can save as a backup file — recipes are never trapped in the app.",
+    description: "Exports the whole library's recipes and collections (format v2) for a backup. The photo/file fields arrive empty: the client fetches each photo's bytes in the browser and embeds them into the backup file it downloads (or hands to saveAutoBackup), because the server cannot read blob bytes back. The client reports the finished backup via markBackupDownloaded.",
     request: z.object({}),
-    response: z.object({
-      version: z.number(),
-      exportedAt: z.string(),
-      collections: z.array(z.object({ id: z.number(), name: z.string() })),
-      recipes: z.array(z.object({
-        title: z.string(),
-        description: z.string(),
-        servings: z.number().nullable(),
-        prepMinutes: z.number().nullable(),
-        cookMinutes: z.number().nullable(),
-        ingredients: z.array(z.string()),
-        steps: z.array(z.string()),
-        tags: z.array(z.string()),
-        course: z.string().nullable(),
-        protein: z.string().nullable(),
-        sourceUrl: z.string().nullable(),
-        sourceName: z.string().nullable(),
-        collectionName: z.string().nullable(),
-        favorite: z.boolean(),
-        rating: z.number().nullable(),
-        status: z.enum(["want", "made"]),
-        cookCount: z.number(),
-        lastCookedAt: z.string().nullable(),
-        notes: z.string(),
-      })),
-    }),
+    response: backupPayloadSchema,
     async handler(ctx) {
-      const db = ctx.db<typeof schema>();
-      const collRows = await db.select().from(schema.collections).orderBy(asc(schema.collections.id));
-      const collNames = new Map(collRows.map((c) => [c.id, c.name]));
-      const rows = await db.select().from(schema.recipes).orderBy(asc(schema.recipes.id));
-      return {
-        version: 1,
-        exportedAt: new Date().toISOString(),
-        collections: collRows.map((c) => ({ id: c.id, name: c.name })),
-        recipes: rows.map((r) => ({
-          title: r.title,
-          description: r.description,
-          servings: r.servings,
-          prepMinutes: r.prepMinutes,
-          cookMinutes: r.cookMinutes,
-          ingredients: parseJsonArray(r.ingredients),
-          steps: parseJsonArray(r.steps),
-          tags: parseJsonArray(r.tags),
-          course: r.course,
-          protein: r.protein,
-          sourceUrl: r.sourceUrl,
-          sourceName: r.sourceName,
-          collectionName: r.collectionId != null ? (collNames.get(r.collectionId) ?? null) : null,
-          favorite: r.favorite === 1,
-          rating: r.rating,
-          status: r.status,
-          cookCount: r.cookCount,
-          lastCookedAt: r.lastCookedAt,
-          notes: r.notes,
-        })),
-      };
+      return buildBackupPayload(ctx);
+    },
+  }),
+
+  markBackupDownloaded: defineAction({
+    description: "Records that the user just downloaded a complete backup file (recipes plus photos), so the backup status can show when the last downloaded backup was taken and what it held.",
+    request: z.object({
+      recipes: z.number().int().nonnegative(),
+      photos: z.number().int().nonnegative(),
+    }),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx, args): Promise<{ ok: true }> {
+      await setSetting(ctx, "last_backup_at", new Date().toISOString());
+      await setSetting(ctx, "last_backup_recipes", String(args.recipes));
+      await setSetting(ctx, "last_backup_photos", String(args.photos));
+      return { ok: true };
     },
   }),
 
   importBackup: defineAction({
-    description: "Imports recipes from a Kitchen Companion backup file, skipping any whose title already exists in the library.",
+    description: "Restores recipes from a Kitchen Companion backup file (format v2 restores the photos and attached files too; v1 files restore recipe text as before), skipping any recipe whose title already exists in the library.",
     request: z.object({
       collections: z.array(z.object({ name: z.string() })).default([]),
-      recipes: z.array(z.object({
-        title: z.string().min(1),
-        description: z.string().default(""),
-        servings: z.number().int().positive().nullable().default(null),
-        prepMinutes: z.number().int().nonnegative().nullable().default(null),
-        cookMinutes: z.number().int().nonnegative().nullable().default(null),
-        ingredients: z.array(z.string()).default([]),
-        steps: z.array(z.string()).default([]),
-        tags: z.array(z.string()).default([]),
-        course: z.string().nullable().default(null),
-        protein: z.string().nullable().default(null),
-        sourceUrl: z.string().nullable().default(null),
-        sourceName: z.string().nullable().default(null),
-        collectionName: z.string().nullable().default(null),
-        favorite: z.boolean().default(false),
-        rating: z.number().int().min(1).max(5).nullable().default(null),
-        status: z.enum(["want", "made"]).default("want"),
-        cookCount: z.number().int().nonnegative().default(0),
-        lastCookedAt: z.string().nullable().default(null),
-        notes: z.string().default(""),
-      })).default([]),
+      recipes: z.array(importRecipeSchema).default([]),
     }),
-    response: z.object({ imported: z.number(), skipped: z.number() }),
+    response: z.object({ imported: z.number(), skipped: z.number(), photosRestored: z.number() }),
+    async handler(ctx, args) {
+      const result = await importLibraryData(ctx, args);
+      ctx.invalidateQueries();
+      return result;
+    },
+  }),
+
+  getBackupStatus: defineAction({
+    description: "Reports where the library stands on backups: how many recipes and photos/files it holds, when the last downloaded backup and the last automatic backup were taken, whether anything changed since, and how many automatic snapshots are kept.",
+    request: z.object({}),
+    response: z.object({
+      recipeCount: z.number(),
+      photoCount: z.number(),
+      lastBackupAt: z.string().nullable(),
+      lastAutoBackupAt: z.string().nullable(),
+      autoBackupPhotos: z.number(),
+      autoPhotosMissing: z.number(),
+      snapshotCount: z.number(),
+      changesSinceBackup: z.boolean(),
+      changesSinceAutoBackup: z.boolean(),
+      autoBackupNeeded: z.boolean(),
+      backendBackupEnabled: z.boolean(),
+      lastBackendBackupAt: z.string().nullable(),
+      friendsOnline: z.boolean(),
+    }),
+    async handler(ctx) {
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.recipes);
+      const photoCount = rows.reduce(
+        (n, r) => n + [r.dishPhotoKey, r.scanPhotoKey, r.sourcePhotoKey, r.attachmentKey].filter(Boolean).length,
+        0,
+      );
+      const [lastBackupAt, lastAutoBackupAt, autoPhotosRaw, autoMissingRaw, backendEnabledRaw, lastBackendBackupAt] = await Promise.all([
+        getSetting(ctx, "last_backup_at", ""),
+        getSetting(ctx, "last_auto_backup_at", ""),
+        getSetting(ctx, "last_auto_backup_photos", "0"),
+        getSetting(ctx, "last_auto_backup_photos_missing", "0"),
+        getSetting(ctx, "backend_backup_enabled", "0"),
+        getSetting(ctx, "last_backend_backup_at", ""),
+      ]);
+      let snapshotCount = 0;
+      try {
+        snapshotCount = (await ctx.blobs.list("backups/")).length;
+      } catch {
+        snapshotCount = 0;
+      }
+      const latestChangeMs = rows.reduce((m, r) => Math.max(m, r.updatedAt.getTime()), 0);
+      const changedSince = (stamp: string) =>
+        rows.length > 0 && (!stamp || latestChangeMs > Date.parse(stamp));
+      return {
+        recipeCount: rows.length,
+        photoCount,
+        lastBackupAt: lastBackupAt || null,
+        lastAutoBackupAt: lastAutoBackupAt || null,
+        autoBackupPhotos: parseInt(autoPhotosRaw, 10) || 0,
+        autoPhotosMissing: parseInt(autoMissingRaw, 10) || 0,
+        snapshotCount,
+        changesSinceBackup: changedSince(lastBackupAt),
+        changesSinceAutoBackup: changedSince(lastAutoBackupAt),
+        autoBackupNeeded: changedSince(lastAutoBackupAt),
+        backendBackupEnabled: backendEnabledRaw === "1",
+        lastBackendBackupAt: lastBackendBackupAt || null,
+        friendsOnline: await kcFriendsOnline(),
+      };
+    },
+  }),
+
+  saveAutoBackup: defineAction({
+    description: "Stores a complete automatic backup snapshot — the full backup payload the client assembled (every recipe plus its photos/files embedded as data) — in the app's own private storage, separate from the working library, keeping the newest 10 snapshots. The client calls this when the app opens and finds changes since the last snapshot.",
+    request: z.object({
+      exportedAt: z.string().min(1),
+      photosUnreadable: z.number().int().nonnegative().default(0),
+      collections: z.array(z.object({ name: z.string() })).default([]),
+      recipes: z.array(importRecipeSchema).default([]),
+    }),
+    response: z.object({
+      ok: z.literal(true),
+      backedUpAt: z.string(),
+      recipes: z.number(),
+      photos: z.number(),
+      snapshotsKept: z.number(),
+      backendSaved: z.boolean(),
+    }),
+    async handler(ctx, args): Promise<{ ok: true; backedUpAt: string; recipes: number; photos: number; snapshotsKept: number; backendSaved: boolean }> {
+      const stamp = args.exportedAt;
+      const stored = {
+        version: 2,
+        exportedAt: stamp,
+        photosUnreadable: args.photosUnreadable,
+        collections: args.collections,
+        recipes: args.recipes,
+      };
+      const key = `backups/${stamp.replace(/[:.]/g, "-")}.json`;
+      await ctx.blobs.put(key, new TextEncoder().encode(JSON.stringify(stored)), { contentType: "application/json" });
+      let kept = 1;
+      try {
+        const all = (await ctx.blobs.list("backups/"))
+          .slice()
+          .sort((a, b) => b.key.localeCompare(a.key));
+        kept = Math.min(all.length, 10);
+        for (const extra of all.slice(10)) {
+          await ctx.blobs.delete(extra.key).catch(() => {});
+        }
+      } catch {
+        kept = 1;
+      }
+      const photos = countImportPhotos(args.recipes);
+      await setSetting(ctx, "last_auto_backup_at", stamp);
+      await setSetting(ctx, "last_auto_backup_recipes", String(args.recipes.length));
+      await setSetting(ctx, "last_auto_backup_photos", String(photos));
+      await setSetting(ctx, "last_auto_backup_photos_missing", String(args.photosUnreadable));
+      // Extra copy on the shared backend — only when Anthony has turned it
+      // on for this copy (setBackendBackup) and a profile exists to own it.
+      // The row carries only the HASH of the owner's private backup key;
+      // restoring demands the key itself (the public code and username
+      // are identifiers, never credentials).
+      let backendSaved = false;
+      const backendEnabled = (await getSetting(ctx, "backend_backup_enabled", "0")) === "1";
+      const me = await getLocalProfile(ctx);
+      if (backendEnabled && me && (await kcFriendsOnline())) {
+        const recoveryHash = await sha256Hex(await getOrCreateRecoveryKey(ctx));
+        const r = await kcFetch<unknown>("kc_backups?on_conflict=kc_id", {
+          method: "POST",
+          headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+          body: JSON.stringify({
+            kc_id: me.kcId,
+            username: me.username,
+            recovery_hash: recoveryHash,
+            payload: {
+              version: 2,
+              exportedAt: stamp,
+              collections: args.collections,
+              recipes: args.recipes,
+            },
+            updated_at: new Date().toISOString(),
+          }),
+        });
+        backendSaved = r.ok;
+        if (backendSaved) await setSetting(ctx, "last_backend_backup_at", stamp);
+      }
+      return { ok: true, backedUpAt: stamp, recipes: args.recipes.length, photos, snapshotsKept: kept, backendSaved };
+    },
+  }),
+
+  getLatestAutoBackup: defineAction({
+    description: "Returns where to fetch the newest automatic backup snapshot (the client downloads it and hands it to importBackup to restore) plus when it was taken and what it holds. This is the recovery path if recipes are ever deleted or the library is lost.",
+    request: z.object({}),
+    response: z.object({
+      found: z.boolean(),
+      url: z.string().nullable(),
+      backedUpAt: z.string().nullable(),
+      recipes: z.number(),
+      photos: z.number(),
+      snapshotCount: z.number(),
+    }),
+    async handler(ctx) {
+      let latestKey: string | null = null;
+      let snapshotCount = 0;
+      try {
+        const all = (await ctx.blobs.list("backups/"))
+          .filter((m) => m.key.endsWith(".json"))
+          .sort((a, b) => b.key.localeCompare(a.key));
+        snapshotCount = all.length;
+        latestKey = all[0]?.key ?? null;
+      } catch {
+        latestKey = null;
+      }
+      if (!latestKey) {
+        return { found: false, url: null, backedUpAt: null, recipes: 0, photos: 0, snapshotCount };
+      }
+      const [backedUpAt, recipesRaw, photosRaw] = await Promise.all([
+        getSetting(ctx, "last_auto_backup_at", ""),
+        getSetting(ctx, "last_auto_backup_recipes", "0"),
+        getSetting(ctx, "last_auto_backup_photos", "0"),
+      ]);
+      return {
+        found: true,
+        url: await safePhotoUrl(ctx, latestKey),
+        backedUpAt: backedUpAt || null,
+        recipes: parseInt(recipesRaw, 10) || 0,
+        photos: parseInt(photosRaw, 10) || 0,
+        snapshotCount,
+      };
+    },
+  }),
+
+  // ---------- profile, friends, sharing ----------
+
+  getProfile: defineAction({
+    description: "Returns this copy's profile (null until the welcome setup is done), whether the shared friends backend is switched on yet, whether the profile is registered on it, and the owner's private backup key (this copy only — it never leaves the owner's own app except as a hash on their server backup).",
+    request: z.object({}),
+    response: z.object({
+      profile: profileDto.nullable(),
+      friendsOnline: z.boolean(),
+      backendSynced: z.boolean(),
+      recoveryKey: z.string().nullable(),
+    }),
+    async handler(ctx) {
+      const me = await getLocalProfile(ctx);
+      const [online, syncedRaw] = await Promise.all([
+        kcFriendsOnline(),
+        getSetting(ctx, "profile_backend_synced", "0"),
+      ]);
+      return {
+        profile: me ? await profileToDto(ctx, me) : null,
+        friendsOnline: online,
+        backendSynced: syncedRaw === "1",
+        recoveryKey: me ? await getOrCreateRecoveryKey(ctx) : null,
+      };
+    },
+  }),
+
+  createProfile: defineAction({
+    description: "Creates this copy's profile during the forced first-run welcome: a unique username, a display name, an optional photo, and a freshly issued Kitchen Companion code (KC-XXXX-XXXX). Registers on the shared backend when it is switched on; existing recipes and data are never touched.",
+    request: z.object({
+      username: z.string().min(1).max(40),
+      displayName: z.string().max(60).default(""),
+      photo: photoAsset.nullable().default(null),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+      profile: profileDto.nullable(),
+      friendsOnline: z.boolean(),
+      recoveryKey: z.string().nullable(),
+    }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
-      const existingColls = await db.select().from(schema.collections);
-      const collIdByName = new Map(existingColls.map((c) => [c.name.toLowerCase(), c.id]));
-      for (const c of args.collections) {
-        const key = c.name.trim().toLowerCase();
-        if (!key || collIdByName.has(key)) continue;
-        const inserted = await db.insert(schema.collections)
-          .values({ name: c.name.trim() })
-          .returning({ id: schema.collections.id });
-        const row = inserted[0];
-        if (row) collIdByName.set(key, row.id);
+      const existing = await getLocalProfile(ctx);
+      if (existing) {
+        return { ok: true, error: null, profile: await profileToDto(ctx, existing), friendsOnline: await kcFriendsOnline(), recoveryKey: await getOrCreateRecoveryKey(ctx) };
       }
-      const existingTitles = new Set(
-        (await db.select({ title: schema.recipes.title }).from(schema.recipes))
-          .map((r) => r.title.trim().toLowerCase()),
+      const username = args.username.trim();
+      if (!USERNAME_RE.test(username)) {
+        return { ok: false, error: USERNAME_ERROR, profile: null, friendsOnline: false, recoveryKey: null };
+      }
+      const online = await kcFriendsOnline();
+      if (online) {
+        const taken = await kcGetProfileByUsername(username);
+        if (taken) {
+          return { ok: false, error: "That username is already taken — try another one.", profile: null, friendsOnline: true, recoveryKey: null };
+        }
+      }
+      let kcId = newKcId();
+      if (online) {
+        for (let i = 0; i < 8 && (await kcGetProfileById(kcId)) != null; i++) kcId = newKcId();
+      }
+      let photoKey: string | null = null;
+      let photoData: string | null = null;
+      if (args.photo) {
+        photoKey = await storeBlobAsset(ctx, args.photo, "profile");
+        // A small copy rides along for the friends directory; very large
+        // photos stay local-only rather than bloating the shared row.
+        if (args.photo.dataBase64.length <= 400_000) {
+          photoData = `data:${args.photo.mimeType};base64,${args.photo.dataBase64}`;
+        }
+      }
+      const inserted = await db.insert(schema.profiles).values({
+        username,
+        displayName: args.displayName.trim(),
+        kcId,
+        photoKey,
+        photoData,
+      }).returning({ id: schema.profiles.id });
+      const rowId = inserted[0]?.id;
+      if (rowId == null) throw new Error("createProfile: no row returned");
+      let synced = false;
+      if (online) synced = await syncProfileToBackend(ctx);
+      await setSetting(ctx, "profile_backend_synced", synced ? "1" : "0");
+      const me = await getLocalProfile(ctx);
+      return { ok: true, error: null, profile: me ? await profileToDto(ctx, me) : null, friendsOnline: online, recoveryKey: await getOrCreateRecoveryKey(ctx) };
+    },
+  }),
+
+  updateProfile: defineAction({
+    description: "Updates the profile's display name and/or photo (the username and code do not change here), and re-registers on the shared backend when it is on.",
+    request: z.object({
+      displayName: z.string().max(60),
+      photo: photoAsset.nullable().default(null),
+    }),
+    response: z.object({
+      ok: z.literal(true),
+      profile: profileDto.nullable(),
+      backendSynced: z.boolean(),
+    }),
+    async handler(ctx, args): Promise<{ ok: true; profile: z.infer<typeof profileDto> | null; backendSynced: boolean }> {
+      const db = ctx.db<typeof schema>();
+      const me = await getLocalProfile(ctx);
+      if (!me) return { ok: true, profile: null, backendSynced: false };
+      const patch: Partial<{ displayName: string; photoKey: string | null; photoData: string | null; updatedAt: Date }> = {
+        displayName: args.displayName.trim(),
+        updatedAt: new Date(),
+      };
+      if (args.photo) {
+        patch.photoKey = await storeBlobAsset(ctx, args.photo, "profile");
+        patch.photoData = args.photo.dataBase64.length <= 400_000
+          ? `data:${args.photo.mimeType};base64,${args.photo.dataBase64}`
+          : null;
+      }
+      await db.update(schema.profiles).set(patch).where(eq(schema.profiles.id, me.id));
+      const online = await kcFriendsOnline();
+      const synced = online ? await syncProfileToBackend(ctx) : false;
+      const fresh = await getLocalProfile(ctx);
+      return { ok: true, profile: fresh ? await profileToDto(ctx, fresh) : null, backendSynced: synced };
+    },
+  }),
+
+  changeUsername: defineAction({
+    description: "Changes the profile's username (Settings only, with care): the Kitchen Companion code never changes, so friends keep finding this user. Checks the name is free on the shared backend when it is on.",
+    request: z.object({ username: z.string().min(1).max(40) }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+      profile: profileDto.nullable(),
+      backendSynced: z.boolean(),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const me = await getLocalProfile(ctx);
+      if (!me) return { ok: false, error: "Create your profile first.", profile: null, backendSynced: false };
+      const username = args.username.trim();
+      if (!USERNAME_RE.test(username)) {
+        return { ok: false, error: USERNAME_ERROR, profile: await profileToDto(ctx, me), backendSynced: false };
+      }
+      if (username.toLowerCase() === me.username.toLowerCase()) {
+        return { ok: true, error: null, profile: await profileToDto(ctx, me), backendSynced: (await getSetting(ctx, "profile_backend_synced", "0")) === "1" };
+      }
+      const online = await kcFriendsOnline();
+      if (online) {
+        const taken = await kcGetProfileByUsername(username);
+        if (taken && taken.kc_id !== me.kcId) {
+          return { ok: false, error: "That username is already taken — try another one.", profile: await profileToDto(ctx, me), backendSynced: false };
+        }
+      }
+      await db.update(schema.profiles)
+        .set({ username, updatedAt: new Date() })
+        .where(eq(schema.profiles.id, me.id));
+      const synced = online ? await syncProfileToBackend(ctx) : false;
+      const fresh = await getLocalProfile(ctx);
+      return { ok: true, error: null, profile: fresh ? await profileToDto(ctx, fresh) : null, backendSynced: synced };
+    },
+  }),
+
+  syncProfile: defineAction({
+    description: "Registers (or refreshes) this profile on the shared backend and pushes any shares made while it was off. Called by the app on open whenever the profile is not yet fully synced.",
+    request: z.object({}),
+    response: z.object({
+      friendsOnline: z.boolean(),
+      backendSynced: z.boolean(),
+      sharesPushed: z.number(),
+    }),
+    async handler(ctx) {
+      const online = await kcFriendsOnline();
+      if (!online) return { friendsOnline: false, backendSynced: false, sharesPushed: 0 };
+      const synced = await syncProfileToBackend(ctx);
+      const sharesPushed = synced ? await pushPendingShares(ctx) : 0;
+      ctx.invalidateQueries();
+      return { friendsOnline: true, backendSynced: synced, sharesPushed };
+    },
+  }),
+
+  getFriends: defineAction({
+    description: "Returns the friends tab: this user's friends (live from the shared backend when on, last-seen cache when off), what friends have shared with this user, and this user's own shares with their sent status.",
+    request: z.object({}),
+    response: z.object({
+      friendsOnline: z.boolean(),
+      friends: z.array(z.object({
+        kcId: z.string(),
+        username: z.string(),
+        displayName: z.string(),
+        photoData: z.string().nullable(),
+      })),
+      sharedWithMe: z.array(z.object({
+        shareKey: z.string(),
+        kind: z.enum(["recipe", "collection"]),
+        title: z.string(),
+        ownerKcId: z.string(),
+        ownerName: z.string(),
+        createdAt: z.string(),
+      })),
+      myShares: z.array(z.object({
+        shareKey: z.string(),
+        kind: z.enum(["recipe", "collection"]),
+        title: z.string(),
+        synced: z.boolean(),
+        createdAt: z.string(),
+      })),
+    }),
+    async handler(ctx) {
+      const db = ctx.db<typeof schema>();
+      const me = await getLocalProfile(ctx);
+      const myShareRows = me
+        ? await db.select().from(schema.localShares).orderBy(desc(schema.localShares.id))
+        : [];
+      const myShares = myShareRows.map((s) => ({
+        shareKey: s.shareKey,
+        kind: s.kind,
+        title: s.title,
+        synced: s.synced === 1,
+        createdAt: s.createdAt.toISOString(),
+      }));
+      const offline = { friendsOnline: false, sharedWithMe: [] as never[], myShares };
+      if (!me) return { ...offline, friends: [] };
+      const online = await kcFriendsOnline();
+      if (!online) {
+        const cached = await db.select().from(schema.localFriends).orderBy(asc(schema.localFriends.addedAt));
+        return {
+          ...offline,
+          friends: cached.map((f) => ({ kcId: f.kcId, username: f.username, displayName: f.displayName, photoData: f.photoData })),
+        };
+      }
+      // Live: my friendships → their profiles; reconcile the local cache.
+      const fr = await kcFetch<Array<{ friend_kc_id: string }>>(
+        `kc_friendships?select=friend_kc_id&owner_kc_id=eq.${encodeURIComponent(me.kcId)}&order=created_at.asc`,
       );
-      let imported = 0;
-      let skipped = 0;
-      for (const r of args.recipes) {
-        const titleKey = r.title.trim().toLowerCase();
-        if (existingTitles.has(titleKey)) { skipped++; continue; }
-        existingTitles.add(titleKey);
-        const cats = keywordCategories(r.title, r.ingredients);
-        await db.insert(schema.recipes).values({
-          title: r.title.trim(),
-          description: r.description,
-          servings: r.servings,
-          prepMinutes: r.prepMinutes,
-          cookMinutes: r.cookMinutes,
-          ingredients: JSON.stringify(r.ingredients),
-          steps: JSON.stringify(r.steps),
-          tags: JSON.stringify(r.tags.map((t) => t.toLowerCase())),
-          course: asCourse(r.course) ?? cats.course,
-          protein: asProtein(r.protein) ?? cats.protein,
-          sourceUrl: r.sourceUrl,
-          sourceName: r.sourceName,
-          collectionId: r.collectionName ? (collIdByName.get(r.collectionName.trim().toLowerCase()) ?? null) : null,
-          favorite: r.favorite ? 1 : 0,
-          rating: r.rating,
-          status: r.status,
-          cookCount: r.cookCount,
-          lastCookedAt: r.lastCookedAt,
-          notes: r.notes,
+      const friendIds = fr.ok ? fr.data.map((r) => r.friend_kc_id) : [];
+      let friends: Array<{ kcId: string; username: string; displayName: string; photoData: string | null }> = [];
+      if (friendIds.length > 0) {
+        const inList = friendIds.map((id) => `"${id}"`).join(",");
+        const pr = await kcFetch<KcProfileRow[]>(
+          `kc_profiles?select=kc_id,username,display_name,photo_data&kc_id=in.(${encodeURIComponent(inList)})`,
+        );
+        const byId = new Map((pr.ok ? pr.data : []).map((p) => [p.kc_id, p]));
+        friends = friendIds
+          .map((id) => byId.get(id))
+          .filter((p): p is KcProfileRow => p != null)
+          .map((p) => ({ kcId: p.kc_id, username: p.username, displayName: p.display_name, photoData: p.photo_data }));
+        await db.delete(schema.localFriends);
+        for (const f of friends) {
+          await db.insert(schema.localFriends).values({
+            kcId: f.kcId, username: f.username, displayName: f.displayName, photoData: f.photoData,
+          });
+        }
+      } else {
+        await db.delete(schema.localFriends);
+      }
+      // What those friends have shared (only what they explicitly shared).
+      let sharedWithMe: Array<{ shareKey: string; kind: "recipe" | "collection"; title: string; ownerKcId: string; ownerName: string; createdAt: string }> = [];
+      if (friendIds.length > 0) {
+        const inList = friendIds.map((id) => `"${id}"`).join(",");
+        const sr = await kcFetch<Array<{ share_key: string; kind: string; title: string; owner_kc_id: string; created_at: string }>>(
+          `kc_shares?select=share_key,kind,title,owner_kc_id,created_at&owner_kc_id=in.(${encodeURIComponent(inList)})&order=created_at.desc&limit=50`,
+        );
+        if (sr.ok) {
+          const nameById = new Map(friends.map((f) => [f.kcId, f.displayName || f.username]));
+          sharedWithMe = sr.data.map((s) => ({
+            shareKey: s.share_key,
+            kind: s.kind === "collection" ? "collection" as const : "recipe" as const,
+            title: s.title,
+            ownerKcId: s.owner_kc_id,
+            ownerName: nameById.get(s.owner_kc_id) ?? "A friend",
+            createdAt: s.created_at,
+          }));
+        }
+      }
+      return { friendsOnline: true, friends, sharedWithMe, myShares };
+    },
+  }),
+
+  addFriend: defineAction({
+    description: "Adds a friend by their Kitchen Companion code: looks the code up on the shared backend, records the friendship there, and caches the friend's profile locally. Adding is one-way seeing: this user will see what that friend shares with their friends.",
+    request: z.object({ code: z.string().min(3).max(20) }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+      friend: z.object({
+        kcId: z.string(),
+        username: z.string(),
+        displayName: z.string(),
+        photoData: z.string().nullable(),
+      }).nullable(),
+    }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const me = await getLocalProfile(ctx);
+      if (!me) return { ok: false, error: "Create your profile first.", friend: null };
+      const code = args.code.trim().toUpperCase();
+      if (code === me.kcId) {
+        return { ok: false, error: "That's your own code — give it to a friend so they can add you.", friend: null };
+      }
+      const online = await kcFriendsOnline();
+      if (!online) {
+        return { ok: false, error: "Friends aren't switched on yet — there's one setup step left on our side. Your friend's code will work here the moment it is.", friend: null };
+      }
+      const target = await kcGetProfileById(code);
+      if (!target) {
+        return { ok: false, error: "No Kitchen Companion cook has that code yet. Check the code with your friend and try again.", friend: null };
+      }
+      const ins = await kcFetch<unknown>("kc_friendships?on_conflict=owner_kc_id,friend_kc_id", {
+        method: "POST",
+        headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
+        body: JSON.stringify({ owner_kc_id: me.kcId, friend_kc_id: target.kc_id }),
+      });
+      if (!ins.ok) {
+        return { ok: false, error: "Your friend couldn't be added just now. Try again in a moment.", friend: null };
+      }
+      await db.insert(schema.localFriends)
+        .values({ kcId: target.kc_id, username: target.username, displayName: target.display_name, photoData: target.photo_data })
+        .onConflictDoUpdate({
+          target: schema.localFriends.kcId,
+          set: { username: target.username, displayName: target.display_name, photoData: target.photo_data },
         });
-        imported++;
+      ctx.invalidateQueries();
+      return {
+        ok: true,
+        error: null,
+        friend: { kcId: target.kc_id, username: target.username, displayName: target.display_name, photoData: target.photo_data },
+      };
+    },
+  }),
+
+  removeFriend: defineAction({
+    description: "Removes a friend from this user's list (on the shared backend and the local cache). The friend is not told, and this user's own shares are untouched.",
+    request: z.object({ kcId: z.string().min(3) }),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx, args): Promise<{ ok: true }> {
+      const db = ctx.db<typeof schema>();
+      const me = await getLocalProfile(ctx);
+      if (me) {
+        await kcFetch<unknown>(
+          `kc_friendships?owner_kc_id=eq.${encodeURIComponent(me.kcId)}&friend_kc_id=eq.${encodeURIComponent(args.kcId)}`,
+          { method: "DELETE", headers: { Prefer: "return=minimal" } },
+        );
+      }
+      await db.delete(schema.localFriends).where(eq(schema.localFriends.kcId, args.kcId));
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  createShare: defineAction({
+    description: "Shares a recipe or a whole collection with this user's friends: the payload the client assembled (same format as a backup, photos included) is kept locally and pushed to the shared backend when it is on; unsent shares are pushed on a later open. Only what is explicitly shared ever leaves the library.",
+    request: z.object({
+      kind: z.enum(["recipe", "collection"]),
+      title: z.string().min(1).max(200),
+      payloadJson: z.string().min(2).max(25_000_000),
+    }),
+    response: z.object({ ok: z.literal(true), synced: z.boolean() }),
+    async handler(ctx, args): Promise<{ ok: true; synced: boolean }> {
+      const db = ctx.db<typeof schema>();
+      try {
+        JSON.parse(args.payloadJson);
+      } catch {
+        throw new Error("createShare: payload is not valid JSON");
+      }
+      const shareKey = crypto.randomUUID();
+      const inserted = await db.insert(schema.localShares).values({
+        shareKey,
+        kind: args.kind,
+        title: args.title,
+        payload: args.payloadJson,
+        synced: 0,
+      }).returning({ id: schema.localShares.id });
+      const rowId = inserted[0]?.id;
+      let synced = false;
+      const me = await getLocalProfile(ctx);
+      if (me && rowId != null && (await kcFriendsOnline())) {
+        const r = await kcFetch<unknown>("kc_shares?on_conflict=share_key", {
+          method: "POST",
+          headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+          body: JSON.stringify({
+            share_key: shareKey,
+            owner_kc_id: me.kcId,
+            kind: args.kind,
+            title: args.title,
+            payload: JSON.parse(args.payloadJson) as unknown,
+          }),
+        });
+        if (r.ok) {
+          synced = true;
+          await db.update(schema.localShares).set({ synced: 1 }).where(eq(schema.localShares.id, rowId));
+        }
       }
       ctx.invalidateQueries();
-      return { imported, skipped };
+      return { ok: true, synced };
+    },
+  }),
+
+  unshare: defineAction({
+    description: "Stops sharing a recipe or collection: removes the share locally and, when the backend is on, from the shared backend too. Friends who already saved a copy keep theirs — this stops it being shared from now on.",
+    request: z.object({ shareKey: z.string().min(8) }),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx, args): Promise<{ ok: true }> {
+      const db = ctx.db<typeof schema>();
+      await db.delete(schema.localShares).where(eq(schema.localShares.shareKey, args.shareKey));
+      await kcFetch<unknown>(`kc_shares?share_key=eq.${encodeURIComponent(args.shareKey)}`, {
+        method: "DELETE",
+        headers: { Prefer: "return=minimal" },
+      });
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  saveSharedRecipe: defineAction({
+    description: "Saves a friend's shared recipe or collection into this user's own library (photos included), skipping anything whose title is already there. Returns the first saved recipe's id so the app can open it.",
+    request: z.object({ shareKey: z.string().min(8) }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+      imported: z.number(),
+      photosRestored: z.number(),
+      recipeId: z.number().nullable(),
+    }),
+    async handler(ctx, args) {
+      const fail = (error: string) => ({ ok: false, error, imported: 0, photosRestored: 0, recipeId: null });
+      const online = await kcFriendsOnline();
+      if (!online) return fail("Friends aren't switched on yet, so this share can't be fetched.");
+      const r = await kcFetch<Array<{ payload: unknown }>>(
+        `kc_shares?select=payload&share_key=eq.${encodeURIComponent(args.shareKey)}&limit=1`,
+      );
+      if (!r.ok || !r.data[0]) return fail("That share could not be found any more.");
+      const checked = z.object({
+        collections: z.array(z.object({ name: z.string() })).default([]),
+        recipes: z.array(importRecipeSchema).default([]),
+      }).safeParse(r.data[0].payload);
+      if (!checked.success) return fail("That share could not be read.");
+      const result = await importLibraryData(ctx, checked.data);
+      let recipeId: number | null = null;
+      const firstTitle = checked.data.recipes[0]?.title.trim().toLowerCase();
+      if (firstTitle) {
+        const db = ctx.db<typeof schema>();
+        const rows = await db.select({ id: schema.recipes.id, title: schema.recipes.title })
+          .from(schema.recipes);
+        recipeId = rows.find((row) => row.title.trim().toLowerCase() === firstTitle)?.id ?? null;
+      }
+      ctx.invalidateQueries();
+      return { ok: true, error: null, imported: result.imported, photosRestored: result.photosRestored, recipeId };
+    },
+  }),
+
+  setBackendBackup: defineAction({
+    description: "Turns the extra server copy of the automatic backup on or off (off by default; Anthony's call). When on, each automatic backup also saves a copy to this user's row on the shared backend, so the library survives even the whole app copy being lost.",
+    request: z.object({ enabled: z.boolean() }),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx, args): Promise<{ ok: true }> {
+      await setSetting(ctx, "backend_backup_enabled", args.enabled ? "1" : "0");
+      return { ok: true };
+    },
+  }),
+
+  restoreBackendBackup: defineAction({
+    description: "Recovers the library from the server backup copy. The public code and username identify whose backup it is; the owner's PRIVATE backup key (issued at setup, never shared with friends) is what unlocks it — its hash must match the one stamped on the backup row. Imports recipes and photos, skipping titles already in the library.",
+    request: z.object({
+      kcId: z.string().min(3).max(20),
+      username: z.string().min(1).max(40),
+      recoveryKey: z.string().min(8).max(64),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+      imported: z.number(),
+      skipped: z.number(),
+      photosRestored: z.number(),
+    }),
+    async handler(ctx, args) {
+      const fail = (error: string) => ({ ok: false, error, imported: 0, skipped: 0, photosRestored: 0 });
+      const online = await kcFriendsOnline();
+      if (!online) return fail("The shared server isn't switched on yet, so the server backup can't be reached.");
+      const kcId = args.kcId.trim().toUpperCase();
+      const r = await kcFetch<Array<{ username: string; payload: unknown; recovery_hash: string | null }>>(
+        `kc_backups?select=username,payload,recovery_hash&kc_id=eq.${encodeURIComponent(kcId)}&limit=1`,
+      );
+      if (!r.ok || !r.data[0]) return fail("No server backup was found for that code.");
+      if (r.data[0].username.trim().toLowerCase() !== args.username.trim().toLowerCase()) {
+        return fail("That code and username don't match — check both and try again.");
+      }
+      if (!r.data[0].recovery_hash) {
+        return fail("That server copy was saved before backup keys existed, so it can't be opened safely. A fresh server copy — saved by a copy of the app that has your recipes — opens with your backup key.");
+      }
+      const presented = await sha256Hex(args.recoveryKey.trim().toUpperCase());
+      if (presented !== r.data[0].recovery_hash) {
+        return fail("That backup key doesn't match. Your backup key is the private one from your setup — it's on your profile in Settings. The code alone can't open a backup.");
+      }
+      const checked = z.object({
+        collections: z.array(z.object({ name: z.string() })).default([]),
+        recipes: z.array(importRecipeSchema).default([]),
+      }).safeParse(r.data[0].payload);
+      if (!checked.success) return fail("The server backup could not be read.");
+      const result = await importLibraryData(ctx, checked.data);
+      ctx.invalidateQueries();
+      return { ok: true, error: null, imported: result.imported, skipped: result.skipped, photosRestored: result.photosRestored };
     },
   }),
 
@@ -1710,7 +2718,7 @@ export const Actions = {
       repoUrl: z.string(),
       checkedAt: z.string(),
     }),
-    async handler(ctx, args) {
+    async handler(_ctx, args) {
       const REPO_URL = "https://github.com/aruikis/Kitchen-Companion";
       const base = { latestVersion: null, latestDate: null, currentDate: null, whatsNew: [] as string[], repoUrl: REPO_URL, checkedAt: new Date().toISOString() };
       const parseVer = (s: string): [number, number, number] | null => {
@@ -1877,6 +2885,7 @@ export const Actions = {
           sourcePhotoKey: d.sourcePhotoKey,
           scanPhotoKey: d.scanPhotoKey,
           attachmentName: d.attachmentName,
+          attachmentKey: d.attachmentKey,
         });
         existingTitles.push(d.title.toLowerCase());
         existingUrls.push(ex.url);

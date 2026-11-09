@@ -10,9 +10,12 @@ type Draft = ApiResponse<typeof api, "importUrl">["draft"];
 type GroceryItem = ApiResponse<typeof api, "listGrocery">["items"][number];
 type JewelOrder = ApiResponse<typeof api, "getShop">["orders"][number];
 type UpdateInfo = ApiResponse<typeof api, "checkForUpdate">;
+type ProfileInfo = ApiResponse<typeof api, "getProfile">;
+type MyProfile = NonNullable<ProfileInfo["profile"]>;
+type FriendsInfo = ApiResponse<typeof api, "getFriends">;
 type PlanEntry = ApiResponse<typeof api, "listPlan">["entries"][number];
 
-type Tab = "recipes" | "add" | "plan" | "shop" | "settings";
+type Tab = "recipes" | "add" | "plan" | "shop" | "friends" | "settings";
 type View =
   | { kind: "main" }
   | { kind: "recipe"; id: number }
@@ -109,7 +112,7 @@ const JEWEL_URL = "https://www.jewelosco.com/";
 
 // Visible version (Anthony's standing rule: the UAT carries its version
 // number in the app, and the GitHub push of this build is tagged with it).
-const APP_VERSION = "1.2.0";
+const APP_VERSION = "1.4.0";
 
 // Automatic categories (chosen by the app when a recipe is added; the cook
 // can correct them). Mirrors the server's lists in actions.ts.
@@ -464,6 +467,34 @@ function TimerBar({ timers, dismiss }: { timers: RunningTimer[]; dismiss: (id: n
 export function App() {
   const [tab, setTab] = useState<Tab>("recipes");
   const [view, setView] = useState<View>({ kind: "main" });
+  const [inWelcome, setInWelcome] = useState(false);
+  const [showTutorial, setShowTutorial] = useState(false);
+  const queryClient = useQueryClient();
+
+  // The profile gates the app: no profile yet → the welcome setup runs
+  // first (once, ever). Existing recipes are never touched by it.
+  const profileQ = useQuery({ queryKey: ["profile"], queryFn: () => api.getProfile({}) });
+  const profile: MyProfile | null = profileQ.data?.profile ?? null;
+  useEffect(() => {
+    if (profileQ.data && !profileQ.data.profile) setInWelcome(true);
+  }, [profileQ.data]);
+  // Register on the shared backend (and push any shares made while it was
+  // off) the first time we see it switched on with an unsynced profile.
+  const syncTried = useRef(false);
+  useEffect(() => {
+    if (syncTried.current) return;
+    const p = profileQ.data;
+    if (!p?.profile) return;
+    syncTried.current = true;
+    if (p.friendsOnline && !p.backendSynced) {
+      void api.syncProfile({})
+        .then(() => {
+          queryClient.invalidateQueries({ queryKey: ["profile"] });
+          queryClient.invalidateQueries({ queryKey: ["friends"] });
+        })
+        .catch(() => { /* the Friends tab shows the state honestly */ });
+    }
+  }, [profileQ.data, queryClient]);
 
   const recipesQ = useQuery({ queryKey: ["recipes"], queryFn: () => api.listRecipes({}) });
   const collectionsQ = useQuery({ queryKey: ["collections"], queryFn: () => api.listCollections({}) });
@@ -479,10 +510,65 @@ export function App() {
   const updateInfo: UpdateInfo | null = updateQ.data ?? null;
   const recipes = recipesQ.data?.recipes ?? [];
   const collections = collectionsQ.data?.collections ?? [];
+  // Automatic backup: on open, check where the library stands; if recipes
+  // or photos changed since the last automatic snapshot, quietly take a
+  // fresh one (in this app's own private storage, never anywhere public).
+  const backupStatusQ = useQuery({
+    queryKey: ["backupStatus"],
+    queryFn: () => api.getBackupStatus({}),
+    staleTime: 1000 * 60 * 5,
+    retry: false,
+  });
+  const autoBackupTried = useRef(false);
+  useEffect(() => {
+    if (autoBackupTried.current) return;
+    const status = backupStatusQ.data;
+    if (!status || recipesQ.isPending) return;
+    autoBackupTried.current = true;
+    if (status.autoBackupNeeded) {
+      void (async () => {
+        try {
+          const { payload } = await assembleBackup(recipes);
+          await api.saveAutoBackup({
+            exportedAt: payload.exportedAt,
+            photosUnreadable: payload.photosUnreadable,
+            collections: payload.collections,
+            recipes: payload.recipes,
+          });
+          queryClient.invalidateQueries({ queryKey: ["backupStatus"] });
+        } catch {
+          /* the backup panel keeps showing a snapshot is still needed */
+        }
+      })();
+    }
+  }, [backupStatusQ.data, recipesQ.isPending, recipes, queryClient]);
 
   const openRecipe = (id: number) => setView({ kind: "recipe", id });
   const openReview = (draft: NonNullable<Draft>, editingId: number | null, previewUrl: string | null) =>
     setView({ kind: "review", draft, editingId, previewUrl });
+
+  if (profileQ.isPending) {
+    return (
+      <div className="flex min-h-screen items-center justify-center" style={{ background: "var(--bg)", color: "var(--text)" }}>
+        <SafeAreaTopScrim backgroundColor="var(--bg)" />
+        <p className="text-base" role="status">Opening Kitchen Companion…</p>
+      </div>
+    );
+  }
+
+  if (inWelcome) {
+    return (
+      <div className="min-h-screen" style={{ background: "var(--bg)", color: "var(--text)" }}>
+        <SafeAreaTopScrim backgroundColor="var(--bg)" />
+        <WelcomeFlow
+          onDone={() => {
+            setInWelcome(false);
+            queryClient.invalidateQueries({ queryKey: ["profile"] });
+          }}
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen" style={{ background: "var(--bg)", color: "var(--text)" }}>
@@ -514,6 +600,7 @@ export function App() {
                   sourcePhotoKey: r.sourcePhotoKey,
                   scanPhotoKey: r.scanPhotoKey,
                   attachmentName: r.attachmentName,
+                  attachmentKey: r.attachmentKey,
                 },
                 r.id,
                 null,
@@ -540,6 +627,7 @@ export function App() {
             loading={recipesQ.isPending}
             error={recipesQ.error ? String(recipesQ.error) : null}
             updateInfo={updateInfo}
+            profile={profile}
             onOpenSettings={() => setTab("settings")}
             onOpen={openRecipe}
             onAdd={() => setTab("add")}
@@ -550,10 +638,26 @@ export function App() {
           <Planner recipes={recipes} onOpen={openRecipe} />
         ) : tab === "shop" ? (
           <GroceryList />
+        ) : tab === "friends" ? (
+          <FriendsView profile={profile} recipes={recipes} collections={collections} onOpenRecipe={openRecipe} />
         ) : (
-          <SettingsView updateInfo={updateInfo} checking={updateQ.isFetching} onRecheck={() => updateQ.refetch()} />
+          <SettingsView
+            updateInfo={updateInfo}
+            checking={updateQ.isFetching}
+            onRecheck={() => updateQ.refetch()}
+            profile={profile}
+            friendsOnline={profileQ.data?.friendsOnline ?? false}
+            recoveryKey={profileQ.data?.recoveryKey ?? null}
+            onShowTutorial={() => setShowTutorial(true)}
+          />
         )}
       </main>
+
+      {showTutorial && (
+        <div className="fixed inset-0 z-50 overflow-y-auto" style={{ background: "var(--bg)" }} role="dialog" aria-label="Tutorial">
+          <Tutorial finishLabel="Done" onFinish={() => setShowTutorial(false)} />
+        </div>
+      )}
 
       {view.kind === "main" && (
         <nav
@@ -561,13 +665,14 @@ export function App() {
           style={{ background: "var(--surface)", borderColor: "var(--border)" }}
           aria-label="Main"
         >
-          <div className="mx-auto grid max-w-3xl grid-cols-5">
+          <div className="mx-auto grid max-w-3xl grid-cols-6">
             {(
               [
                 ["recipes", "📖", "Recipes"],
                 ["add", "＋", "Add"],
                 ["plan", "🗓", "Plan"],
                 ["shop", "🛒", "Shop"],
+                ["friends", "👥", "Friends"],
                 ["settings", "⚙️", "Settings"],
               ] as Array<[Tab, string, string]>
             ).map(([key, icon, label]) => (
@@ -595,13 +700,14 @@ export function App() {
 type Filter = "all" | "favorites" | "want" | "made";
 
 function Library({
-  recipes, collections, loading, error, updateInfo, onOpenSettings, onOpen, onAdd,
+  recipes, collections, loading, error, updateInfo, profile, onOpenSettings, onOpen, onAdd,
 }: {
   recipes: Recipe[];
   collections: Collection[];
   loading: boolean;
   error: string | null;
   updateInfo: UpdateInfo | null;
+  profile: MyProfile | null;
   onOpenSettings: () => void;
   onOpen: (id: number) => void;
   onAdd: () => void;
@@ -868,7 +974,7 @@ function Library({
         })}
       </div>
 
-      {recipes.length > 0 && <BackupBar recipes={recipes} collections={collections} />}
+      <BackupBar recipes={recipes} collections={collections} profile={profile} />
 
       <footer className="mt-8 pb-2 text-center">
         <p className="text-xs" style={{ color: "var(--dim)" }}>Kitchen Companion UAT · Version {APP_VERSION}</p>
@@ -888,64 +994,320 @@ function Library({
   );
 }
 
-function BackupBar({ recipes, collections }: { recipes: Recipe[]; collections: Collection[] }) {
+type BackupAsset = { mimeType: string; dataBase64: string };
+type AssembledBackup = ApiResponse<typeof api, "exportLibrary">;
+
+async function fetchPhotoAsset(url: string): Promise<BackupAsset | null> {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const buf = await res.arrayBuffer();
+    if (buf.byteLength === 0) return null;
+    const ct = (res.headers.get("content-type") ?? "").split(";")[0]?.trim();
+    return { mimeType: ct || "application/octet-stream", dataBase64: bytesToBase64(new Uint8Array(buf)) };
+  } catch {
+    return null;
+  }
+}
+
+// Builds the COMPLETE backup payload: exportLibrary supplies the recipe
+// text; each photo's bytes are fetched here in the browser (the server
+// cannot read them back out of storage) and embedded as data — so the
+// finished payload holds the recipes AND their photos and files. The same
+// payload is downloaded as the backup file and stored as the automatic
+// backup snapshot. A photo that cannot be fetched is counted and
+// reported, never silently left out.
+async function assembleBackup(recipes: Recipe[]): Promise<{ payload: AssembledBackup; photos: number; photosFailed: number }> {
+  const data = await api.exportLibrary({});
+  const byId = new Map(recipes.map((r) => [r.id, r]));
+  let photos = 0;
+  let photosFailed = 0;
+  const out: AssembledBackup["recipes"] = [];
+  for (const r of data.recipes) {
+    const dto = byId.get(r.id);
+    const grab = async (url: string | null | undefined): Promise<BackupAsset | null> => {
+      if (!url) return null;
+      const asset = await fetchPhotoAsset(url);
+      if (asset) photos++;
+      else photosFailed++;
+      return asset;
+    };
+    const [dishPhoto, scanPhoto, sourcePhoto, attachment] = await Promise.all([
+      grab(dto?.dishPhotoUrl),
+      grab(dto?.scanPhotoUrl),
+      grab(dto?.sourcePhotoUrl),
+      grab(dto?.attachmentUrl),
+    ]);
+    out.push({ ...r, dishPhoto, scanPhoto, sourcePhoto, attachment });
+  }
+  return { payload: { ...data, recipes: out, photosUnreadable: photosFailed }, photos, photosFailed };
+}
+
+function BackupBar({ recipes, collections, profile }: { recipes: Recipe[]; collections: Collection[]; profile: MyProfile | null }) {
   const [msg, setMsg] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [serverCode, setServerCode] = useState(profile?.kcId ?? "");
+  const [serverName, setServerName] = useState(profile?.username ?? "");
+  const [serverKey, setServerKey] = useState("");
+  const profileQ = useQuery({ queryKey: ["profile"], queryFn: () => api.getProfile({}) });
+  useEffect(() => {
+    const k = profileQ.data?.recoveryKey;
+    if (k) setServerKey((prev) => prev || k);
+  }, [profileQ.data]);
   const fileRef = useRef<HTMLInputElement>(null);
   const queryClient = useQueryClient();
+  const statusQ = useQuery({ queryKey: ["backupStatus"], queryFn: () => api.getBackupStatus({}) });
+  const status = statusQ.data ?? null;
 
   const doExport = async () => {
-    setBusy(true);
+    setMsg(null);
+    setBusy("Gathering your recipes and photos…");
     try {
-      const data = await api.exportLibrary({});
-      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+      const { payload, photos, photosFailed } = await assembleBackup(recipes);
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
       a.download = `kitchen-companion-backup-${localDateStr(new Date())}.json`;
       a.click();
       URL.revokeObjectURL(url);
-      setMsg("Backup saved. Keep it somewhere safe — your recipes are yours, and this file proves it.");
+      await api.markBackupDownloaded({ recipes: payload.recipes.length, photos }).catch(() => {});
+      queryClient.invalidateQueries({ queryKey: ["backupStatus"] });
+      setMsg(
+        photosFailed > 0
+          ? `Backup saved — ${payload.recipes.length} recipes and ${photos} photos in one file. ⚠️ ${photosFailed} photo${photosFailed === 1 ? "" : "s"} could not be read, so ${photosFailed === 1 ? "it is" : "they are"} not in this backup — download it again in a moment, and if it keeps happening, tell Muse.`
+          : `Backup saved — ${payload.recipes.length} recipe${payload.recipes.length === 1 ? "" : "s"} and ${photos} photo${photos === 1 ? "" : "s"}, all in one file. Keep it somewhere safe: it is a complete copy of your collection, photos included.`,
+      );
     } catch {
       setMsg("The backup could not be made just now. Try again in a moment.");
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   };
 
+  const runImport = async (parsed: unknown, fromAuto: boolean) => {
+    const obj = parsed as { collections?: unknown; recipes?: unknown };
+    const result = await api.importBackup({
+      collections: Array.isArray(obj.collections) ? (obj.collections as Array<{ name: string }>) : [],
+      recipes: Array.isArray(obj.recipes) ? (obj.recipes as never[]) : [],
+    });
+    queryClient.invalidateQueries({ queryKey: ["recipes"] });
+    queryClient.invalidateQueries({ queryKey: ["collections"] });
+    queryClient.invalidateQueries({ queryKey: ["backupStatus"] });
+    setMsg(
+      `Restored ${result.imported} recipe${result.imported === 1 ? "" : "s"} and ${result.photosRestored} photo${result.photosRestored === 1 ? "" : "s"}${fromAuto ? " from the automatic backup" : ""}${result.skipped > 0 ? ` (${result.skipped} already in your library, skipped)` : ""}.`,
+    );
+  };
+
   const doImport = async (file: File) => {
-    setBusy(true);
+    setMsg(null);
+    setBusy("Restoring…");
     try {
       const parsed: unknown = JSON.parse(await file.text());
-      const obj = parsed as { collections?: unknown; recipes?: unknown };
-      const result = await api.importBackup({
-        collections: Array.isArray(obj.collections) ? (obj.collections as Array<{ name: string }>) : [],
-        recipes: Array.isArray(obj.recipes) ? (obj.recipes as never[]) : [],
-      });
-      setMsg(`Restored ${result.imported} recipe${result.imported === 1 ? "" : "s"}${result.skipped > 0 ? ` (${result.skipped} already in your library, skipped)` : ""}.`);
-      queryClient.invalidateQueries({ queryKey: ["recipes"] });
-      queryClient.invalidateQueries({ queryKey: ["collections"] });
+      await runImport(parsed, false);
     } catch {
       setMsg("That file could not be read as a Kitchen Companion backup.");
     } finally {
-      setBusy(false);
+      setBusy(null);
+    }
+  };
+
+  const doToggleServerCopy = async (enabled: boolean) => {
+    setMsg(null);
+    try {
+      await api.setBackendBackup({ enabled });
+      queryClient.invalidateQueries({ queryKey: ["backupStatus"] });
+      setMsg(enabled
+        ? "Server copy is ON — the next automatic backup will also save a copy on the shared Kitchen Companion server, under your code."
+        : "Server copy is OFF — your backups stay in this app and in the files you download.");
+    } catch {
+      setMsg("That couldn't be changed just now. Try again in a moment.");
+    }
+  };
+
+  const doRestoreServer = async () => {
+    setMsg(null);
+    setBusy("Fetching your server backup…");
+    try {
+      const result = await api.restoreBackendBackup({ kcId: serverCode, username: serverName, recoveryKey: serverKey });
+      if (!result.ok) {
+        setMsg(result.error ?? "The server backup could not be restored.");
+        return;
+      }
+      queryClient.invalidateQueries({ queryKey: ["recipes"] });
+      queryClient.invalidateQueries({ queryKey: ["collections"] });
+      queryClient.invalidateQueries({ queryKey: ["backupStatus"] });
+      setMsg(`Recovered ${result.imported} recipe${result.imported === 1 ? "" : "s"} and ${result.photosRestored} photo${result.photosRestored === 1 ? "" : "s"} from the server backup${result.skipped > 0 ? ` (${result.skipped} already in your library, skipped)` : ""}.`);
+    } catch {
+      setMsg("The server backup could not be restored just now. Try again in a moment.");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const doRestoreAuto = async () => {
+    setMsg(null);
+    setBusy("Restoring from the automatic backup…");
+    try {
+      const latest = await api.getLatestAutoBackup({});
+      if (!latest.found || !latest.url) {
+        setMsg("No automatic backup has been saved yet — one is made when the app opens and your library has changed.");
+        return;
+      }
+      const res = await fetch(latest.url);
+      if (!res.ok) throw new Error("snapshot fetch failed");
+      const parsed: unknown = await res.json();
+      await runImport(parsed, true);
+    } catch {
+      setMsg("The automatic backup could not be restored just now. Try again in a moment.");
+    } finally {
+      setBusy(null);
     }
   };
 
   return (
     <div className="mt-8 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }}>
-      <h2 className="font-display text-base font-bold">Your backup</h2>
+      <h2 className="font-display text-base font-bold">{status && !status.lastAutoBackupAt && !status.lastBackupAt ? "🛟 Your backup" : "🛟 Your recipes are backed up"}</h2>
       <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
-        Download your whole collection as one file, any time. If this app ever went away, your
-        recipes would still be yours — {recipes.length} recipe{recipes.length === 1 ? "" : "s"} in {collections.length} collection{collections.length === 1 ? "" : "s"}.
+        Your recipes and the photos with them live in this app, in your own Muse account — they are
+        never sent to GitHub or anywhere public. Kitchen Companion also keeps its own automatic backup
+        copies inside the app, and you can download a complete backup file of your own at any time. If
+        recipes were ever lost, either copy brings everything back — photos included. Right now:{" "}
+        {recipes.length} recipe{recipes.length === 1 ? "" : "s"} in {collections.length} collection{collections.length === 1 ? "" : "s"}
+        {status ? `, with ${status.photoCount} photo${status.photoCount === 1 ? "" : "s"} and files` : ""}.
       </p>
+
+      {status && (
+        <div className="mt-2 space-y-1 text-sm">
+          {status.lastAutoBackupAt ? (
+            <p style={{ color: "var(--herb)" }} role="status">
+              ✓ Automatic backup: {fmtDateTime(status.lastAutoBackupAt)} — {status.autoBackupPhotos} photo{status.autoBackupPhotos === 1 ? "" : "s"} held
+              {status.snapshotCount > 0 ? ` across ${status.snapshotCount} saved cop${status.snapshotCount === 1 ? "y" : "ies"}` : ""}.
+              {status.autoPhotosMissing > 0 && (
+                <span style={{ color: "var(--accent)" }}> {status.autoPhotosMissing} photo{status.autoPhotosMissing === 1 ? "" : "s"} could not be included last time.</span>
+              )}
+            </p>
+          ) : (
+            <p style={{ color: "var(--dim)" }} role="status">
+              The first automatic backup is taken when the app opens with changes to save.
+            </p>
+          )}
+          {status.changesSinceAutoBackup && status.lastAutoBackupAt && (
+            <p style={{ color: "var(--dim)" }}>
+              You’ve changed recipes since that snapshot — a fresh one is taken when the app opens.
+            </p>
+          )}
+          {status.lastBackupAt ? (
+            <p style={{ color: "var(--dim)" }}>
+              Last backup you downloaded: {fmtDateTime(status.lastBackupAt)}.
+              {status.changesSinceBackup ? " You’ve changed recipes since then — worth downloading a fresh one." : ""}
+            </p>
+          ) : (
+            <p style={{ color: "var(--accent)" }}>
+              You haven’t downloaded a backup of your own yet — the button below makes one file with everything in it, photos included.
+            </p>
+          )}
+        </div>
+      )}
+
+      {status && !status.lastAutoBackupAt && !status.lastBackupAt && (
+        <p className="mt-2 text-sm font-semibold" style={{ color: "var(--accent)" }} role="status">
+          ⚠️ Nothing is backed up yet — right now your recipes live only in this app. The first
+          automatic backup runs on its own when the app opens with changes to save, or download one
+          right now with the button below.
+        </p>
+      )}
+
+      {status && (
+        <div className="mt-3 rounded-lg px-3 py-3" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
+          <h3 className="text-sm font-bold">Extra copy on the shared server</h3>
+          <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
+            {status.backendBackupEnabled
+              ? status.lastBackendBackupAt
+                ? `On — a copy was saved to the shared Kitchen Companion server ${fmtDateTime(status.lastBackendBackupAt)}, under your code. It means your recipes survive even if this whole app copy is lost.`
+                : "On — the next automatic backup will also save a copy to the shared Kitchen Companion server, under your code."
+              : "Off — your backups live in this app and in the files you download. Turn this on and each automatic backup also saves a copy to the shared Kitchen Companion server (the one friends use), under your code — so your recipes survive even if this whole app copy is lost. It is Anthony's call for the household."}
+          </p>
+          <button
+            type="button"
+            onClick={() => void doToggleServerCopy(!status.backendBackupEnabled)}
+            disabled={busy != null}
+            className="mt-2 rounded-full px-4 py-2 text-sm font-semibold disabled:opacity-50"
+            style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
+          >
+            {status.backendBackupEnabled ? "Turn the server copy off" : "Turn the server copy on"}
+          </button>
+          {!status.friendsOnline && (
+            <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>
+              The server copy also waits for that one-time setup step on the shared server — creating
+              its Kitchen Companion tables, a two-minute job in the Supabase dashboard; Anthony has
+              the exact instructions. You can switch this on now, and it starts working the moment
+              that step is done.
+            </p>
+          )}
+          <details className="mt-3">
+            <summary className="cursor-pointer text-sm font-semibold">Recover from the server copy</summary>
+            <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
+              If this app copy was ever lost and rebuilt, it takes three things: your Kitchen
+              Companion code, your username, and your private backup key (in Settings → Your
+              profile). The code and username say whose backup it is; only the key can open it.
+            </p>
+            <div className="mt-2 grid gap-2">
+              <label className="text-sm font-medium" htmlFor="server-code">Your Kitchen Companion code</label>
+              <input
+                id="server-code"
+                value={serverCode}
+                onChange={(e) => setServerCode(e.target.value)}
+                placeholder="KC-XXXX-XXXX"
+                className="rounded-lg px-3 py-2 text-sm uppercase outline-none"
+                style={{ background: "var(--surface)", border: "1px solid var(--border)", color: "var(--text)" }}
+              />
+              <label className="text-sm font-medium" htmlFor="server-username">Your username</label>
+              <input
+                id="server-username"
+                value={serverName}
+                onChange={(e) => setServerName(e.target.value)}
+                placeholder="Your username"
+                className="rounded-lg px-3 py-2 text-sm outline-none"
+                style={{ background: "var(--surface)", border: "1px solid var(--border)", color: "var(--text)" }}
+              />
+              <label className="text-sm font-medium" htmlFor="server-key">Your private backup key</label>
+              <input
+                id="server-key"
+                value={serverKey}
+                onChange={(e) => setServerKey(e.target.value)}
+                placeholder="XXXX-XXXX-XXXX-XXXX"
+                autoCapitalize="characters"
+                autoCorrect="off"
+                className="rounded-lg px-3 py-2 text-sm uppercase outline-none"
+                style={{ background: "var(--surface)", border: "1px solid var(--border)", color: "var(--text)" }}
+              />
+              <button
+                type="button"
+                onClick={() => void doRestoreServer()}
+                disabled={busy != null || !serverCode.trim() || !serverName.trim() || serverKey.trim().length < 8}
+                className="rounded-full px-4 py-2 text-sm font-semibold disabled:opacity-50"
+                style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
+              >
+                Recover my recipes
+              </button>
+            </div>
+          </details>
+        </div>
+      )}
+
       <div className="mt-3 flex flex-wrap gap-2">
-        <button type="button" onClick={doExport} disabled={busy} className="rounded-full px-4 py-2 text-sm font-semibold" style={{ background: "var(--accent)", color: "var(--accent-ink)" }}>
+        <button type="button" onClick={doExport} disabled={busy != null || recipes.length === 0} className="rounded-full px-4 py-2 text-sm font-semibold disabled:opacity-50" style={{ background: "var(--accent)", color: "var(--accent-ink)" }}>
           Download backup
         </button>
-        <button type="button" onClick={() => fileRef.current?.click()} disabled={busy} className="rounded-full px-4 py-2 text-sm font-semibold" style={{ background: "var(--surface2)", color: "var(--text)", border: "1px solid var(--border)" }}>
+        <button type="button" onClick={() => fileRef.current?.click()} disabled={busy != null} className="rounded-full px-4 py-2 text-sm font-semibold disabled:opacity-50" style={{ background: "var(--surface2)", color: "var(--text)", border: "1px solid var(--border)" }}>
           Restore from backup
         </button>
+        {status && status.snapshotCount > 0 && (
+          <button type="button" onClick={doRestoreAuto} disabled={busy != null} className="rounded-full px-4 py-2 text-sm font-semibold disabled:opacity-50" style={{ background: "var(--surface2)", color: "var(--text)", border: "1px solid var(--border)" }}>
+            Restore automatic backup
+          </button>
+        )}
         <input
           ref={fileRef}
           type="file"
@@ -959,7 +1321,697 @@ function BackupBar({ recipes, collections }: { recipes: Recipe[]; collections: C
           }}
         />
       </div>
+      {busy && <p className="mt-2 text-sm" style={{ color: "var(--dim)" }} role="status">{busy}</p>}
       {msg && <p className="mt-2 text-sm" style={{ color: "var(--herb)" }} role="status">{msg}</p>}
+    </div>
+  );
+}
+
+// ---------- profile, welcome, tutorial, friends ----------
+
+/** A small, square-ish profile photo: upright (EXIF applied) and ≤256px. */
+async function profilePhotoFromFile(file: File): Promise<LoadedPhoto> {
+  const full = await photoToBase64(file);
+  try {
+    const img = new Image();
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error("image load failed"));
+      img.src = full.previewUrl;
+    });
+    const max = 256;
+    const scale = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+    const c = canvas.getContext("2d");
+    if (!c) return full;
+    c.drawImage(img, 0, 0, canvas.width, canvas.height);
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+    return { dataBase64: dataUrl.split(",")[1] ?? full.dataBase64, mimeType: "image/jpeg", previewUrl: dataUrl };
+  } catch {
+    return full;
+  }
+}
+
+function Avatar({ name, photoData, photoUrl, size = 44 }: { name: string; photoData?: string | null; photoUrl?: string | null; size?: number }) {
+  const src = photoData ?? photoUrl;
+  if (src) {
+    return <img src={src} alt="" className="rounded-full object-cover" style={{ width: size, height: size }} />;
+  }
+  return (
+    <span aria-hidden className="flex shrink-0 items-center justify-center rounded-full font-bold" style={{ width: size, height: size, background: "var(--surface2)", border: "1px solid var(--border)", color: "var(--text)", fontSize: Math.round(size * 0.42) }}>
+      {(name.trim()[0] ?? "?").toUpperCase()}
+    </span>
+  );
+}
+
+// One recipe in the share/backup import shape, photos fetched and embedded.
+async function recipeToShareShape(r: Recipe) {
+  const [dishPhoto, scanPhoto, sourcePhoto, attachment] = await Promise.all([
+    r.dishPhotoUrl ? fetchPhotoAsset(r.dishPhotoUrl) : Promise.resolve(null),
+    r.scanPhotoUrl ? fetchPhotoAsset(r.scanPhotoUrl) : Promise.resolve(null),
+    r.sourcePhotoUrl ? fetchPhotoAsset(r.sourcePhotoUrl) : Promise.resolve(null),
+    r.attachmentUrl ? fetchPhotoAsset(r.attachmentUrl) : Promise.resolve(null),
+  ]);
+  return {
+    title: r.title,
+    description: r.description,
+    servings: r.servings,
+    prepMinutes: r.prepMinutes,
+    cookMinutes: r.cookMinutes,
+    ingredients: r.ingredients,
+    steps: r.steps,
+    tags: r.tags,
+    course: r.course,
+    protein: r.protein,
+    sourceUrl: r.sourceUrl,
+    sourceName: r.sourceName,
+    collectionName: null as string | null,
+    favorite: r.favorite,
+    rating: r.rating,
+    status: r.status,
+    cookCount: r.cookCount,
+    lastCookedAt: r.lastCookedAt,
+    notes: r.notes,
+    attachmentName: r.attachmentName,
+    dishPhoto,
+    scanPhoto,
+    sourcePhoto,
+    attachment,
+  };
+}
+
+async function buildSharePayload(list: Recipe[], collectionName: string | null) {
+  const recipes = [];
+  for (const r of list) {
+    recipes.push({ ...(await recipeToShareShape(r)), collectionName });
+  }
+  return { collections: collectionName ? [{ name: collectionName }] : [], recipes };
+}
+
+// The quick tour: five stops, one idea each, big plain words. Shown once,
+// forced, at the end of first setup; re-openable from Settings.
+const TUTORIAL_STOPS: Array<{ icon: string; title: string; body: string }> = [
+  {
+    icon: "➕",
+    title: "Add a recipe",
+    body: "Paste a link, take a photo of a cookbook page, upload a file, or just type it in. Every recipe lands on one check-and-fix screen first — nothing is saved until you say so.",
+  },
+  {
+    icon: "🍳",
+    title: "Your recipe pages",
+    body: "Change the servings and the amounts change themselves. Tick off ingredients and steps as you cook, and Cook Mode keeps your screen awake, timers and all.",
+  },
+  {
+    icon: "🗓️",
+    title: "Plan the week, shop in one go",
+    body: "Put meals on the week planner and the shopping list builds itself. Send it to Jewel-Osco with one tap — you sign in and pay on Jewel's own site, just like always.",
+  },
+  {
+    icon: "👥",
+    title: "Friends & sharing",
+    body: "Add friends with their Kitchen Companion code. Share a recipe — or a whole collection — with the people on your list. Only what you choose to share is ever seen. The rest of your library stays private.",
+  },
+  {
+    icon: "🛟",
+    title: "Backed up, automatically",
+    body: "Your recipes and their photos are backed up on their own — you never have to think about it. They live in your own Muse account, never anywhere public.",
+  },
+];
+
+function Tutorial({ finishLabel, onFinish }: { finishLabel: string; onFinish: () => void }) {
+  const [step, setStep] = useState(0);
+  const stop = TUTORIAL_STOPS[step] ?? TUTORIAL_STOPS[0];
+  const last = step === TUTORIAL_STOPS.length - 1;
+  if (!stop) return null;
+  return (
+    <div className="mx-auto flex min-h-screen w-full max-w-xl flex-col px-6 py-8">
+      <div className="flex flex-1 flex-col items-center justify-center text-center">
+        <div className="text-6xl" aria-hidden>{stop.icon}</div>
+        <h2 className="font-display mt-5 text-2xl font-bold">{stop.title}</h2>
+        <p className="mt-3 max-w-md text-base leading-relaxed" style={{ color: "var(--dim)" }}>{stop.body}</p>
+      </div>
+      <div className="flex items-center justify-center gap-2" aria-hidden>
+        {TUTORIAL_STOPS.map((s, i) => (
+          <span key={s.title} className="h-2 w-2 rounded-full" style={{ background: i === step ? "var(--accent)" : "var(--border)" }} />
+        ))}
+      </div>
+      <div className="mt-5 flex gap-2">
+        {step > 0 && (
+          <button
+            type="button"
+            onClick={() => setStep(step - 1)}
+            className="rounded-full px-5 py-3 text-base font-semibold"
+            style={{ background: "var(--surface2)", color: "var(--text)", border: "1px solid var(--border)" }}
+          >
+            ← Back
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={() => (last ? onFinish() : setStep(step + 1))}
+          className="flex-1 rounded-full py-3 text-base font-bold"
+          style={{ background: "var(--accent)", color: "var(--accent-ink)" }}
+        >
+          {last ? finishLabel : "Next →"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// First-run, once ever, no skipping: hello → username → your code → tour.
+// Existing recipes are never touched — the profile simply goes on top.
+function WelcomeFlow({ onDone }: { onDone: () => void }) {
+  const [step, setStep] = useState<"hello" | "create" | "code" | "tour">("hello");
+  const [username, setUsername] = useState("");
+  const [displayName, setDisplayName] = useState("");
+  const [photo, setPhoto] = useState<LoadedPhoto | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [created, setCreated] = useState<MyProfile | null>(null);
+  const [recoveryKey, setRecoveryKey] = useState<string | null>(null);
+  const [friendsOnline, setFriendsOnline] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [keyCopied, setKeyCopied] = useState(false);
+  const photoRef = useRef<HTMLInputElement>(null);
+
+  if (step === "tour") {
+    return <Tutorial finishLabel="Enter Kitchen Companion 🎉" onFinish={onDone} />;
+  }
+
+  const create = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      const res = await api.createProfile({
+        username,
+        displayName,
+        photo: photo ? { dataBase64: photo.dataBase64, mimeType: photo.mimeType } : null,
+      });
+      if (!res.ok || !res.profile) {
+        setError(res.error ?? "That couldn't be saved — try again.");
+        return;
+      }
+      setCreated(res.profile);
+      setRecoveryKey(res.recoveryKey);
+      setFriendsOnline(res.friendsOnline);
+      setStep("code");
+    } catch {
+      setError("That couldn't be saved — try again in a moment.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="mx-auto flex min-h-screen w-full max-w-xl flex-col px-6 py-8">
+      {step === "hello" && (
+        <>
+          <div className="flex flex-1 flex-col items-center justify-center text-center">
+            <div className="text-7xl" aria-hidden>🍳</div>
+            <h1 className="font-display mt-5 text-3xl font-bold">Welcome to Kitchen Companion</h1>
+            <p className="mt-3 max-w-md text-base leading-relaxed" style={{ color: "var(--dim)" }}>
+              Your recipes, all in one place — the ones you find, the ones you scan from a cookbook,
+              the ones passed down. Let’s set you up. It takes a minute, and you only do it once.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setStep("create")}
+            className="w-full rounded-full py-3 text-base font-bold"
+            style={{ background: "var(--accent)", color: "var(--accent-ink)" }}
+          >
+            Let’s get you set up →
+          </button>
+        </>
+      )}
+
+      {step === "create" && (
+        <>
+          <div className="flex-1">
+            <h1 className="font-display text-3xl font-bold">First, your name in the kitchen</h1>
+            <p className="mt-2 text-base leading-relaxed" style={{ color: "var(--dim)" }}>
+              Pick a username — it’s how friends find you. Already have recipes in here? They stay
+              exactly as they are. This just puts your name on them.
+            </p>
+
+            <label className="mt-6 block text-sm font-bold" htmlFor="welcome-username">Username</label>
+            <input
+              id="welcome-username"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              placeholder="e.g. LizCooks"
+              autoCapitalize="off"
+              autoCorrect="off"
+              className="mt-1 w-full rounded-lg px-3 py-3 text-base outline-none"
+              style={{ background: "var(--surface)", border: "1px solid var(--border)", color: "var(--text)" }}
+            />
+            <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>3 to 20 characters — letters, numbers, and underscores only.</p>
+
+            <label className="mt-4 block text-sm font-bold" htmlFor="welcome-display-name">Your name, as friends will see it</label>
+            <input
+              id="welcome-display-name"
+              value={displayName}
+              onChange={(e) => setDisplayName(e.target.value)}
+              placeholder="e.g. Liz"
+              className="mt-1 w-full rounded-lg px-3 py-3 text-base outline-none"
+              style={{ background: "var(--surface)", border: "1px solid var(--border)", color: "var(--text)" }}
+            />
+
+            <div className="mt-4 flex items-center gap-3">
+              <Avatar name={displayName || username || "?"} photoUrl={photo?.previewUrl ?? null} size={52} />
+              <button
+                type="button"
+                onClick={() => photoRef.current?.click()}
+                className="rounded-full px-4 py-2 text-sm font-semibold"
+                style={{ background: "var(--surface2)", color: "var(--text)", border: "1px solid var(--border)" }}
+              >
+                {photo ? "Change the photo" : "Add a photo (if you like)"}
+              </button>
+              <input
+                ref={photoRef}
+                type="file"
+                accept="image/*"
+                className="hidden"
+                aria-label="Choose a profile photo"
+                onChange={async (e) => {
+                  const f = e.target.files?.[0];
+                  e.target.value = "";
+                  if (!f) return;
+                  try {
+                    setPhoto(await profilePhotoFromFile(f));
+                  } catch {
+                    setError("That photo couldn't be used — you can add one later in Settings.");
+                  }
+                }}
+              />
+            </div>
+
+            {error && (
+              <p className="mt-4 rounded-[var(--radius)] px-4 py-3 text-sm font-medium" style={{ background: "var(--surface)", border: "1px solid var(--accent)", color: "var(--text)" }} role="alert">
+                {error}
+              </p>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={() => void create()}
+            disabled={busy || !username.trim()}
+            className="mt-6 w-full rounded-full py-3 text-base font-bold disabled:opacity-50"
+            style={{ background: "var(--accent)", color: "var(--accent-ink)" }}
+          >
+            {busy ? "Creating…" : "Create my profile"}
+          </button>
+        </>
+      )}
+
+      {step === "code" && created && (
+        <>
+          <div className="flex flex-1 flex-col items-center justify-center text-center">
+            <div className="text-6xl" aria-hidden>🎉</div>
+            <h1 className="font-display mt-5 text-3xl font-bold">You’re in, {created.displayName || created.username}!</h1>
+            <p className="mt-3 max-w-md text-base leading-relaxed" style={{ color: "var(--dim)" }}>
+              This is your Kitchen Companion code. Give it to friends so they can add you — and it
+              marks your backup as yours. It’s always waiting for you in Settings, too.
+            </p>
+            <div className="mt-5 rounded-[var(--radius)] px-6 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }}>
+              <p className="font-display text-3xl font-bold tracking-wide">{created.kcId}</p>
+              <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>@{created.username}</p>
+            </div>
+            <button
+              type="button"
+              onClick={async () => setCopied(await copyText(created.kcId))}
+              className="mt-4 rounded-full px-4 py-2 text-sm font-semibold"
+              style={{ background: "var(--surface2)", color: "var(--text)", border: "1px solid var(--border)" }}
+            >
+              {copied ? "✓ Code copied" : "📋 Copy my code"}
+            </button>
+            {recoveryKey && (
+              <div className="mt-5 max-w-md rounded-[var(--radius)] px-4 py-3 text-left" style={{ background: "var(--surface)", border: "1px solid var(--border)" }}>
+                <p className="text-sm font-bold">🔑 And this one is just for you — your backup key</p>
+                <p className="font-display mt-1 text-xl font-bold tracking-wide">{recoveryKey}</p>
+                <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
+                  Different from your code: the code is for friends, this key is private. It’s the
+                  only thing that can open your server backup. It lives in Settings → Your profile
+                  whenever you need it — no need to memorize it now.
+                </p>
+                <button
+                  type="button"
+                  onClick={async () => setKeyCopied(await copyText(recoveryKey))}
+                  className="mt-2 rounded-full px-4 py-2 text-sm font-semibold"
+                  style={{ background: "var(--surface2)", color: "var(--text)", border: "1px solid var(--border)" }}
+                >
+                  {keyCopied ? "✓ Key copied" : "📋 Copy my backup key"}
+                </button>
+              </div>
+            )}
+            {!friendsOnline && (
+              <p className="mt-4 max-w-md text-sm" style={{ color: "var(--dim)" }}>
+                One honest note: there’s one setup step left, and it’s ours, not yours — the shared
+                server needs its Kitchen Companion tables created, one time only. Anthony has the
+                exact instructions (a two-minute job in the Supabase dashboard). Your code already
+                works — hand it out now, and friends will light up on their own the moment it’s done.
+              </p>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={() => setStep("tour")}
+            className="w-full rounded-full py-3 text-base font-bold"
+            style={{ background: "var(--accent)", color: "var(--accent-ink)" }}
+          >
+            Now, a quick tour →
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+function FriendsView({
+  profile, recipes, collections, onOpenRecipe,
+}: {
+  profile: MyProfile | null;
+  recipes: Recipe[];
+  collections: Collection[];
+  onOpenRecipe: (id: number) => void;
+}) {
+  const queryClient = useQueryClient();
+  const friendsQ = useQuery({ queryKey: ["friends"], queryFn: () => api.getFriends({}) });
+  const data: FriendsInfo | null = friendsQ.data ?? null;
+  const [code, setCode] = useState("");
+  const [msg, setMsg] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [removingId, setRemovingId] = useState<string | null>(null);
+  const [savedIds, setSavedIds] = useState<Record<string, number | null>>({});
+  const [shareCollectionId, setShareCollectionId] = useState<number | null>(null);
+
+  const online = data?.friendsOnline ?? false;
+
+  const doAdd = async () => {
+    setMsg(null);
+    setBusy("Adding…");
+    try {
+      const res = await api.addFriend({ code });
+      if (!res.ok) {
+        setMsg(res.error ?? "That friend couldn't be added.");
+        return;
+      }
+      setCode("");
+      queryClient.invalidateQueries({ queryKey: ["friends"] });
+      setMsg(`${res.friend?.displayName || res.friend?.username || "Your friend"} is on your list now. Anything they share with their friends will show up below.`);
+    } catch {
+      setMsg("That friend couldn't be added just now. Try again in a moment.");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const doRemove = async (kcId: string) => {
+    setBusy("Removing…");
+    try {
+      await api.removeFriend({ kcId });
+      queryClient.invalidateQueries({ queryKey: ["friends"] });
+      setMsg("Removed from your list.");
+    } catch {
+      setMsg("That couldn't be done just now. Try again in a moment.");
+    } finally {
+      setBusy(null);
+      setRemovingId(null);
+    }
+  };
+
+  const doSaveShared = async (shareKey: string) => {
+    setMsg(null);
+    setBusy("Saving…");
+    try {
+      const res = await api.saveSharedRecipe({ shareKey });
+      if (!res.ok) {
+        setMsg(res.error ?? "That couldn't be saved.");
+        return;
+      }
+      queryClient.invalidateQueries({ queryKey: ["recipes"] });
+      queryClient.invalidateQueries({ queryKey: ["collections"] });
+      setSavedIds((prev) => ({ ...prev, [shareKey]: res.recipeId }));
+      setMsg(res.imported > 0
+        ? `Saved to your recipes — ${res.imported} recipe${res.imported === 1 ? "" : "s"} and ${res.photosRestored} photo${res.photosRestored === 1 ? "" : "s"}.`
+        : "You already have that one in your library.");
+    } catch {
+      setMsg("That couldn't be saved just now. Try again in a moment.");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const doShareCollection = async () => {
+    const coll = collections.find((c) => c.id === shareCollectionId);
+    if (!coll) return;
+    const inColl = recipes.filter((r) => r.collectionId === coll.id);
+    if (inColl.length === 0) {
+      setMsg("That collection has no recipes in it yet.");
+      return;
+    }
+    setMsg(null);
+    setBusy("Sharing…");
+    try {
+      const payload = await buildSharePayload(inColl, coll.name);
+      const res = await api.createShare({ kind: "collection", title: coll.name, payloadJson: JSON.stringify(payload) });
+      queryClient.invalidateQueries({ queryKey: ["friends"] });
+      setMsg(res.synced
+        ? `“${coll.name}” is shared with your friends — all ${inColl.length} recipes, photos included.`
+        : `“${coll.name}” is marked to share. It will be sent to your friends the moment friends are switched on.`);
+    } catch {
+      setMsg("That couldn't be shared just now. Try again in a moment.");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const doUnshare = async (shareKey: string) => {
+    setBusy("Stopping…");
+    try {
+      await api.unshare({ shareKey });
+      queryClient.invalidateQueries({ queryKey: ["friends"] });
+      setMsg("Stopped sharing that. (Anyone who already saved a copy keeps theirs.)");
+    } catch {
+      setMsg("That couldn't be done just now. Try again in a moment.");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div>
+      <h1 className="font-display text-3xl font-bold">Friends</h1>
+      <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
+        Cook together, apart. Share recipes with the people on your list — only what you choose, nothing else.
+      </p>
+
+      {profile && (
+        <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="Your profile">
+          <div className="flex items-center gap-3">
+            <Avatar name={profile.displayName || profile.username} photoData={profile.photoData} photoUrl={profile.photoUrl} size={56} />
+            <div className="min-w-0">
+              <p className="truncate text-lg font-bold">{profile.displayName || profile.username}</p>
+              <p className="text-sm" style={{ color: "var(--dim)" }}>@{profile.username}</p>
+              <p className="font-display text-base font-bold tracking-wide">{profile.kcId}</p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={async () => setCopied(await copyText(profile.kcId))}
+            className="mt-3 rounded-full px-4 py-2 text-sm font-semibold"
+            style={{ background: "var(--surface2)", color: "var(--text)", border: "1px solid var(--border)" }}
+          >
+            {copied ? "✓ Code copied" : "📋 Copy my code — give it to friends"}
+          </button>
+        </section>
+      )}
+
+      {friendsQ.isPending && <p className="mt-4 text-sm" role="status" style={{ color: "var(--dim)" }}>Loading your friends…</p>}
+
+      {data && !online && (
+        <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="Friends coming on">
+          <h2 className="font-display text-xl font-bold">Friends are nearly switched on</h2>
+          <p className="mt-1 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
+            Here’s exactly what’s left, so there’s no mystery: the shared Kitchen Companion server
+            needs its tables created — a one-time, two-minute job in the Supabase dashboard, and
+            Anthony has the step-by-step instructions. It’s our step, not yours. The moment it’s
+            done, this page wakes up on its own: adding friends by code, seeing their shares, all of
+            it. Your code already works — hand it out now — and anything you mark to share in the
+            meantime is kept safe and sent then.
+          </p>
+        </section>
+      )}
+
+      {data && (
+        <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="Add a friend">
+          <h2 className="font-display text-xl font-bold">Add a friend</h2>
+          <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
+            Type the Kitchen Companion code they gave you. Then you’ll see what they share with their friends.
+          </p>
+          <div className="mt-3 flex gap-2">
+            <label className="sr-only" htmlFor="friend-code">Friend’s Kitchen Companion code</label>
+            <input
+              id="friend-code"
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+              placeholder="KC-XXXX-XXXX"
+              autoCapitalize="characters"
+              autoCorrect="off"
+              className="min-w-0 flex-1 rounded-lg px-3 py-2.5 text-base uppercase outline-none"
+              style={{ background: "var(--surface2)", border: "1px solid var(--border)", color: "var(--text)" }}
+            />
+            <button
+              type="button"
+              onClick={() => void doAdd()}
+              disabled={busy != null || !code.trim()}
+              className="rounded-full px-4 py-2 text-sm font-bold disabled:opacity-50"
+              style={{ background: "var(--accent)", color: "var(--accent-ink)" }}
+            >
+              Add friend
+            </button>
+          </div>
+
+          {data.friends.length > 0 ? (
+            <ul className="mt-4 space-y-2">
+              {data.friends.map((f) => (
+                <li key={f.kcId} className="flex items-center gap-3 rounded-lg px-3 py-2" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
+                  <Avatar name={f.displayName || f.username} photoData={f.photoData} size={40} />
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-bold">{f.displayName || f.username}</p>
+                    <p className="text-xs" style={{ color: "var(--dim)" }}>@{f.username} · {f.kcId}</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => (removingId === f.kcId ? void doRemove(f.kcId) : setRemovingId(f.kcId))}
+                    disabled={busy != null}
+                    className="rounded-full px-3 py-1.5 text-xs font-semibold disabled:opacity-50"
+                    style={{ background: "var(--surface)", color: removingId === f.kcId ? "var(--accent)" : "var(--text)", border: "1px solid var(--border)" }}
+                  >
+                    {removingId === f.kcId ? "Tap again to remove" : "Remove"}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="mt-3 text-sm" style={{ color: "var(--dim)" }}>
+              {online ? "No friends yet — add your first with their code above." : "Your friends will appear here once friends are switched on."}
+            </p>
+          )}
+        </section>
+      )}
+
+      {data && data.sharedWithMe.length > 0 && (
+        <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="Shared with you">
+          <h2 className="font-display text-xl font-bold">Shared with you</h2>
+          <ul className="mt-3 space-y-2">
+            {data.sharedWithMe.map((s) => {
+              const savedId = savedIds[s.shareKey];
+              const isSaved = s.shareKey in savedIds;
+              return (
+                <li key={s.shareKey} className="rounded-lg px-3 py-3" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
+                  <p className="text-sm font-bold">{s.kind === "collection" ? "📚 " : "🍽️ "}{s.title}</p>
+                  <p className="mt-0.5 text-xs" style={{ color: "var(--dim)" }}>
+                    From {s.ownerName} · {s.kind === "collection" ? "a whole collection" : "a recipe"}
+                  </p>
+                  {isSaved ? (
+                    <button
+                      type="button"
+                      disabled={savedId == null}
+                      onClick={() => savedId != null && onOpenRecipe(savedId)}
+                      className="mt-2 rounded-full px-4 py-2 text-sm font-semibold disabled:opacity-60"
+                      style={{ background: "var(--surface)", color: "var(--herb)", border: "1px solid var(--border)" }}
+                    >
+                      {savedId != null ? "✓ Saved — open it" : "✓ Already in your library"}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => void doSaveShared(s.shareKey)}
+                      disabled={busy != null}
+                      className="mt-2 rounded-full px-4 py-2 text-sm font-bold disabled:opacity-50"
+                      style={{ background: "var(--herb)", color: "#10240c" }}
+                    >
+                      Save to my recipes
+                    </button>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </section>
+      )}
+
+      {data && (
+        <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="What you have shared">
+          <h2 className="font-display text-xl font-bold">What you’re sharing</h2>
+          <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
+            Share any single recipe from its own page (the “Share with friends” button). Share a whole
+            collection here. Nothing else in your library is ever visible to friends.
+          </p>
+          {collections.length > 0 && (
+            <div className="mt-3">
+              <div className="flex flex-wrap gap-2" role="group" aria-label="Choose a collection to share">
+                {collections.map((c) => (
+                  <button
+                    key={c.id}
+                    type="button"
+                    onClick={() => setShareCollectionId(c.id === shareCollectionId ? null : c.id)}
+                    aria-pressed={c.id === shareCollectionId}
+                    className="rounded-full px-3 py-1.5 text-sm font-semibold"
+                    style={{
+                      background: c.id === shareCollectionId ? "var(--accent)" : "var(--surface2)",
+                      color: c.id === shareCollectionId ? "var(--accent-ink)" : "var(--text)",
+                      border: "1px solid var(--border)",
+                    }}
+                  >
+                    {c.name}
+                  </button>
+                ))}
+              </div>
+              <button
+                type="button"
+                onClick={() => void doShareCollection()}
+                disabled={busy != null || shareCollectionId == null}
+                className="mt-2 rounded-full px-4 py-2 text-sm font-bold disabled:opacity-50"
+                style={{ background: "var(--herb)", color: "#10240c" }}
+              >
+                Share this collection
+              </button>
+            </div>
+          )}
+          {data.myShares.length > 0 ? (
+            <ul className="mt-3 space-y-2">
+              {data.myShares.map((s) => (
+                <li key={s.shareKey} className="flex items-center gap-3 rounded-lg px-3 py-2" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-bold">{s.kind === "collection" ? "📚 " : "🍽️ "}{s.title}</p>
+                    <p className="text-xs" style={{ color: "var(--dim)" }}>{s.synced ? "Shared with your friends" : "Will be sent when friends are switched on"}</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void doUnshare(s.shareKey)}
+                    disabled={busy != null}
+                    className="rounded-full px-3 py-1.5 text-xs font-semibold disabled:opacity-50"
+                    style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
+                  >
+                    Stop sharing
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="mt-3 text-sm" style={{ color: "var(--dim)" }}>You’re not sharing anything yet.</p>
+          )}
+        </section>
+      )}
+
+      {busy && <p className="mt-3 text-sm" role="status" style={{ color: "var(--dim)" }}>{busy}</p>}
+      {msg && <p className="mt-3 text-sm" role="status" style={{ color: "var(--herb)" }}>{msg}</p>}
     </div>
   );
 }
@@ -1138,6 +2190,20 @@ function RecipeDetail({
     },
   });
   const updateMut = useMutation({ mutationFn: api.updateRecipe, onSuccess: invalidate });
+  const shareFriendsMut = useMutation({
+    mutationFn: async () => {
+      if (!recipe) throw new Error("no recipe");
+      const payload = await buildSharePayload([recipe], null);
+      return api.createShare({ kind: "recipe", title: recipe.title, payloadJson: JSON.stringify(payload) });
+    },
+    onSuccess: (res) => {
+      queryClient.invalidateQueries({ queryKey: ["friends"] });
+      setNotice(res.synced
+        ? "Shared with your friends 👥 — they’ll see it under “Shared with you” on their Friends tab."
+        : "Marked to share with your friends 👥 — it will be sent the moment friends are switched on. You can see it on the Friends tab.");
+    },
+    onError: () => setNotice("That couldn't be shared just now. Try again in a moment."),
+  });
 
   useEffect(() => {
     setTargetServings(recipe?.servings ?? null);
@@ -1189,6 +2255,7 @@ function RecipeDetail({
         scanPhotoKey: recipe.scanPhotoKey,
         sourcePhotoKey: recipe.sourcePhotoKey,
         attachmentName: recipe.attachmentName,
+        attachmentKey: recipe.attachmentKey,
       });
       setNotice("Your photo of the finished dish is on the page.");
     } catch {
@@ -1380,6 +2447,15 @@ function RecipeDetail({
           style={{ background: "var(--herb)", color: "#10240c" }}
         >
           {jewelMut.isPending ? "Building your Jewel-Osco list…" : "🛒 Shop this recipe at Jewel-Osco"}
+        </button>
+        <button
+          type="button"
+          disabled={shareFriendsMut.isPending}
+          onClick={() => shareFriendsMut.mutate()}
+          className="col-span-2 rounded-full py-2.5 text-sm font-semibold disabled:opacity-50"
+          style={{ background: "var(--surface2)", color: "var(--text)", border: "1px solid var(--border)" }}
+        >
+          {shareFriendsMut.isPending ? "Sharing…" : "👥 Share with friends"}
         </button>
       </div>
 
@@ -1582,7 +2658,16 @@ function RecipeDetail({
         </section>
       )}
       {recipe.attachmentName && (
-        <p className="mt-4 text-sm" style={{ color: "var(--dim)" }}>📎 Original file kept with this recipe: {recipe.attachmentName}</p>
+        <p className="mt-4 text-sm" style={{ color: "var(--dim)" }}>
+          📎 Original file kept with this recipe:{" "}
+          {recipe.attachmentUrl ? (
+            <a href={recipe.attachmentUrl} target="_blank" rel="noreferrer" style={{ color: "var(--accent)", textDecoration: "underline" }}>
+              {recipe.attachmentName}
+            </a>
+          ) : (
+            recipe.attachmentName
+          )}
+        </p>
       )}
 
       <div className="mt-8 flex flex-wrap gap-2 border-t pt-4" style={{ borderColor: "var(--border)" }}>
@@ -1793,7 +2878,6 @@ function AddRecipe({ onReview }: { onReview: (draft: NonNullable<Draft>, editing
     try {
       const dataBase64 = await fileToRawBase64(file);
       const stored = await api.storeAttachment({ dataBase64, mimeType: file.type || "application/octet-stream", filename: file.name });
-      void stored;
       onReview(
         {
           title: "",
@@ -1812,6 +2896,7 @@ function AddRecipe({ onReview }: { onReview: (draft: NonNullable<Draft>, editing
           sourcePhotoKey: null,
           scanPhotoKey: null,
           attachmentName: file.name,
+          attachmentKey: stored.key,
         },
         null,
         null,
@@ -1840,6 +2925,7 @@ function AddRecipe({ onReview }: { onReview: (draft: NonNullable<Draft>, editing
     sourcePhotoKey: null,
     scanPhotoKey: null,
     attachmentName: null,
+    attachmentKey: null,
   };
 
   return (
@@ -2059,6 +3145,7 @@ function ReviewForm({
         scanPhotoKey: draft.scanPhotoKey ?? editingRecipe?.scanPhotoKey ?? null,
         sourcePhotoKey: draft.sourcePhotoKey ?? editingRecipe?.sourcePhotoKey ?? null,
         attachmentName: draft.attachmentName ?? editingRecipe?.attachmentName ?? null,
+        attachmentKey: draft.attachmentKey ?? editingRecipe?.attachmentKey ?? null,
       };
       if (editingId != null) {
         await api.updateRecipe({ id: editingId, ...payload });
@@ -2265,22 +3352,218 @@ function fmtDateTime(iso: string): string {
 }
 
 function SettingsView({
-  updateInfo, checking, onRecheck,
+  updateInfo, checking, onRecheck, profile, friendsOnline, recoveryKey, onShowTutorial,
 }: {
   updateInfo: UpdateInfo | null;
   checking: boolean;
   onRecheck: () => void;
+  profile: MyProfile | null;
+  friendsOnline: boolean;
+  recoveryKey: string | null;
+  onShowTutorial: () => void;
 }) {
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+  const queryClient = useQueryClient();
+  const backupStatusQ = useQuery({ queryKey: ["backupStatus"], queryFn: () => api.getBackupStatus({}) });
+  const backupStatus = backupStatusQ.data ?? null;
+  const [displayNameDraft, setDisplayNameDraft] = useState<string | null>(null);
+  const [usernameDraft, setUsernameDraft] = useState("");
+  const [confirmingName, setConfirmingName] = useState(false);
+  const [profileMsg, setProfileMsg] = useState<string | null>(null);
+  const [profileBusy, setProfileBusy] = useState(false);
+  const [codeCopied, setCodeCopied] = useState(false);
+  const [keyCopied, setKeyCopied] = useState(false);
+  const profilePhotoRef = useRef<HTMLInputElement>(null);
   const currentNotes = notesFor(APP_VERSION);
   const latest = updateInfo?.latestVersion ?? null;
   const updateText = latest
     ? `Please update my Kitchen Companion app to the latest version, v${latest}. Get it from the public GitHub repo: https://github.com/aruikis/Kitchen-Companion — use the version tagged v${latest}. Please keep all of my recipes, collections, and settings exactly as they are, install the new version the same way this app was installed before, and when it's done, tell me what's new in it.`
     : "";
 
+  const saveDisplayName = async () => {
+    if (!profile) return;
+    setProfileBusy(true);
+    setProfileMsg(null);
+    try {
+      await api.updateProfile({ displayName: displayNameDraft ?? profile.displayName, photo: null });
+      queryClient.invalidateQueries({ queryKey: ["profile"] });
+      queryClient.invalidateQueries({ queryKey: ["friends"] });
+      setProfileMsg("Your name is saved.");
+    } catch {
+      setProfileMsg("That couldn't be saved just now. Try again in a moment.");
+    } finally {
+      setProfileBusy(false);
+    }
+  };
+
+  const savePhoto = async (file: File) => {
+    if (!profile) return;
+    setProfileBusy(true);
+    setProfileMsg(null);
+    try {
+      const photo = await profilePhotoFromFile(file);
+      await api.updateProfile({ displayName: displayNameDraft ?? profile.displayName, photo: { dataBase64: photo.dataBase64, mimeType: photo.mimeType } });
+      queryClient.invalidateQueries({ queryKey: ["profile"] });
+      queryClient.invalidateQueries({ queryKey: ["friends"] });
+      setProfileMsg("Your photo is saved.");
+    } catch {
+      setProfileMsg("That photo couldn't be saved. Try a different one.");
+    } finally {
+      setProfileBusy(false);
+    }
+  };
+
+  const saveUsername = async () => {
+    if (!profile) return;
+    setProfileBusy(true);
+    setProfileMsg(null);
+    try {
+      const res = await api.changeUsername({ username: usernameDraft });
+      if (!res.ok) {
+        setProfileMsg(res.error ?? "That username couldn't be taken.");
+        return;
+      }
+      queryClient.invalidateQueries({ queryKey: ["profile"] });
+      setConfirmingName(false);
+      setUsernameDraft("");
+      setProfileMsg("Your username is changed. Your code is the same as ever, so friends still find you.");
+    } catch {
+      setProfileMsg("That couldn't be changed just now. Try again in a moment.");
+    } finally {
+      setProfileBusy(false);
+    }
+  };
+
   return (
     <div>
       <h1 className="font-display text-3xl font-bold">Settings</h1>
+
+      {profile && (
+        <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="Your profile">
+          <h2 className="font-display text-xl font-bold">👤 Your profile</h2>
+          <div className="mt-3 flex items-center gap-3">
+            <Avatar name={profile.displayName || profile.username} photoData={profile.photoData} photoUrl={profile.photoUrl} size={64} />
+            <div className="min-w-0">
+              <p className="truncate text-lg font-bold">{profile.displayName || profile.username}</p>
+              <p className="text-sm" style={{ color: "var(--dim)" }}>@{profile.username}</p>
+              <p className="font-display text-base font-bold tracking-wide">{profile.kcId}</p>
+            </div>
+          </div>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={async () => setCodeCopied(await copyText(profile.kcId))}
+              className="rounded-full px-4 py-2 text-sm font-semibold"
+              style={{ background: "var(--surface2)", color: "var(--text)", border: "1px solid var(--border)" }}
+            >
+              {codeCopied ? "✓ Code copied" : "📋 Copy my code"}
+            </button>
+            <button
+              type="button"
+              onClick={() => profilePhotoRef.current?.click()}
+              disabled={profileBusy}
+              className="rounded-full px-4 py-2 text-sm font-semibold disabled:opacity-50"
+              style={{ background: "var(--surface2)", color: "var(--text)", border: "1px solid var(--border)" }}
+            >
+              Change my photo
+            </button>
+            <input
+              ref={profilePhotoRef}
+              type="file"
+              accept="image/*"
+              className="hidden"
+              aria-label="Choose a new profile photo"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                e.target.value = "";
+                if (f) void savePhoto(f);
+              }}
+            />
+          </div>
+
+          <label className="mt-4 block text-sm font-bold" htmlFor="settings-display-name">Your name, as friends see it</label>
+          <div className="mt-1 flex gap-2">
+            <input
+              id="settings-display-name"
+              value={displayNameDraft ?? profile.displayName}
+              onChange={(e) => setDisplayNameDraft(e.target.value)}
+              className="min-w-0 flex-1 rounded-lg px-3 py-2 text-sm outline-none"
+              style={{ background: "var(--surface2)", border: "1px solid var(--border)", color: "var(--text)" }}
+            />
+            <button
+              type="button"
+              onClick={() => void saveDisplayName()}
+              disabled={profileBusy}
+              className="rounded-full px-4 py-2 text-sm font-semibold disabled:opacity-50"
+              style={{ background: "var(--surface2)", color: "var(--text)", border: "1px solid var(--border)" }}
+            >
+              Save name
+            </button>
+          </div>
+
+          <details className="mt-4">
+            <summary className="cursor-pointer text-sm font-bold">Change my username</summary>
+            <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
+              Take care here: your username is how friends find you by name. Your Kitchen Companion
+              code — {profile.kcId} — never changes, so anyone who has your code still finds you.
+              {!friendsOnline && " (Friends aren't switched on yet, so the new name is checked against everyone the moment they are.)"}
+            </p>
+            <div className="mt-2 flex gap-2">
+              <label className="sr-only" htmlFor="settings-username">New username</label>
+              <input
+                id="settings-username"
+                value={usernameDraft}
+                onChange={(e) => { setUsernameDraft(e.target.value); setConfirmingName(false); }}
+                placeholder={profile.username}
+                autoCapitalize="off"
+                autoCorrect="off"
+                className="min-w-0 flex-1 rounded-lg px-3 py-2 text-sm outline-none"
+                style={{ background: "var(--surface2)", border: "1px solid var(--border)", color: "var(--text)" }}
+              />
+              <button
+                type="button"
+                onClick={() => (confirmingName ? void saveUsername() : setConfirmingName(true))}
+                disabled={profileBusy || !usernameDraft.trim()}
+                className="rounded-full px-4 py-2 text-sm font-semibold disabled:opacity-50"
+                style={{ background: "var(--surface2)", color: confirmingName ? "var(--accent)" : "var(--text)", border: "1px solid var(--border)" }}
+              >
+                {confirmingName ? "Tap again to change it" : "Change username"}
+              </button>
+            </div>
+          </details>
+
+          {recoveryKey && (
+            <details className="mt-4">
+              <summary className="cursor-pointer text-sm font-bold">🔑 My private backup key</summary>
+              <p className="font-display mt-2 text-xl font-bold tracking-wide">{recoveryKey}</p>
+              <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
+                This is NOT your friend code — it’s private. It’s the only thing that can open your
+                server backup if this app copy is ever lost and rebuilt. Don’t give it out like your
+                code; keep it for yourself.
+              </p>
+              <button
+                type="button"
+                onClick={async () => setKeyCopied(await copyText(recoveryKey))}
+                className="mt-2 rounded-full px-4 py-2 text-sm font-semibold"
+                style={{ background: "var(--surface2)", color: "var(--text)", border: "1px solid var(--border)" }}
+              >
+                {keyCopied ? "✓ Key copied" : "📋 Copy my backup key"}
+              </button>
+            </details>
+          )}
+
+          <button
+            type="button"
+            onClick={onShowTutorial}
+            className="mt-4 rounded-full px-4 py-2 text-sm font-semibold"
+            style={{ background: "var(--surface2)", color: "var(--text)", border: "1px solid var(--border)" }}
+          >
+            🎓 Show the tutorial again
+          </button>
+
+          {profileMsg && <p className="mt-2 text-sm" role="status" style={{ color: "var(--herb)" }}>{profileMsg}</p>}
+        </section>
+      )}
 
       <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="App updates">
         <h2 className="font-display text-xl font-bold">⬆️ App updates</h2>
@@ -2401,11 +3684,47 @@ function SettingsView({
         )}
       </section>
 
+      <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="Backup and safety">
+        <h2 className="font-display text-xl font-bold">🛟 Backup &amp; safety</h2>
+        <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
+          Your recipes and their photos live in this app, in your own Muse account — never on GitHub,
+          never anywhere public. So they can’t be lost, Kitchen Companion keeps automatic backup copies
+          of everything (recipes and photos together) inside the app, and you can download a complete
+          backup file of your own from the bottom of the Recipes tab.
+        </p>
+        {backupStatus ? (
+          <div className="mt-2 space-y-1 text-sm">
+            <p style={{ color: "var(--dim)" }}>
+              In this library: {backupStatus.recipeCount} recipe{backupStatus.recipeCount === 1 ? "" : "s"} and {backupStatus.photoCount} photo{backupStatus.photoCount === 1 ? "" : "s"} and files.
+            </p>
+            {backupStatus.lastAutoBackupAt ? (
+              <p style={{ color: "var(--herb)" }} role="status">
+                ✓ Last automatic backup: {fmtDateTime(backupStatus.lastAutoBackupAt)}
+                {backupStatus.snapshotCount > 0 ? ` · ${backupStatus.snapshotCount} cop${backupStatus.snapshotCount === 1 ? "y" : "ies"} kept` : ""}.
+              </p>
+            ) : (
+              <p style={{ color: "var(--dim)" }} role="status">
+                The first automatic backup is taken when the app opens with changes to save.
+              </p>
+            )}
+            <p style={{ color: "var(--dim)" }}>
+              {backupStatus.lastBackupAt
+                ? `Last backup you downloaded: ${fmtDateTime(backupStatus.lastBackupAt)}.`
+                : "You haven’t downloaded a backup of your own yet."}{" "}
+              Downloading and restoring both happen at the bottom of the Recipes tab.
+            </p>
+          </div>
+        ) : (
+          <p className="mt-2 text-sm" style={{ color: "var(--dim)" }} role="status">Checking your backups…</p>
+        )}
+      </section>
+
       <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="About and version history">
         <h2 className="font-display text-xl font-bold">About</h2>
         <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
           Kitchen Companion UAT · Version {APP_VERSION}. Your recipes live in this app, in your own
-          Muse account — and you can download a full backup any time from the bottom of the Recipes tab.
+          Muse account. They are backed up automatically inside the app, and you can download a
+          complete backup — recipes and photos together — any time from the bottom of the Recipes tab.
         </p>
         <h3 className="mt-3 text-sm font-bold">Version history</h3>
         <div className="mt-1 space-y-2">

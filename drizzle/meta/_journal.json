@@ -29,6 +29,20 @@
       "when": 1794237786293,
       "tag": "0004_add_recipe_categories",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1794239525597,
+      "tag": "0005_add_attachment_key_to_recipes",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1794240383844,
+      "tag": "0006_add_profiles_friends_shares_tables",
+      "breakpoints": true
     }
   ]
 }
