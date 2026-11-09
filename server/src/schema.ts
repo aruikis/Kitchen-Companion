@@ -19,6 +19,12 @@ export const recipes = sqliteTable("recipes", {
   ingredients: text("ingredients").notNull().default("[]"),
   steps: text("steps").notNull().default("[]"),
   tags: text("tags").notNull().default("[]"),
+  // Automatic categories (Liz's request, Nov 9 2026): course ("Main Dishes",
+  // "Desserts", …) and protein/type ("Poultry", "Beef", …), filled in by the
+  // app when a recipe is added and correctable by the cook. Time category is
+  // derived from prep+cook minutes, never stored.
+  course: text("course"),
+  protein: text("protein"),
   sourceUrl: text("source_url"),
   sourceName: text("source_name"),
   collectionId: integer("collection_id"),

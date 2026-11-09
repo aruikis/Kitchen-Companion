@@ -17,6 +17,8 @@ const draftShape = {
   ingredients: z.array(z.string()).default([]),
   steps: z.array(z.string()).default([]),
   tags: z.array(z.string()).default([]),
+  course: z.string().nullable().default(null),
+  protein: z.string().nullable().default(null),
   sourceUrl: z.string().nullable().default(null),
   sourceName: z.string().nullable().default(null),
   collectionId: z.number().int().nullable().default(null),
@@ -37,6 +39,9 @@ const recipeDto = z.object({
   ingredients: z.array(z.string()),
   steps: z.array(z.string()),
   tags: z.array(z.string()),
+  course: z.string().nullable(),
+  protein: z.string().nullable(),
+  timeTag: z.string().nullable(),
   sourceUrl: z.string().nullable(),
   sourceName: z.string().nullable(),
   collectionId: z.number().nullable(),
@@ -80,6 +85,115 @@ async function safePhotoUrl(ctx: Ctx, key: string | null): Promise<string | null
   }
 }
 
+// ---------- automatic categories ----------
+// Liz asked (Nov 9, 2026) for recipes to categorise themselves: a course
+// (appetizers, main dishes, desserts…), a protein/type (poultry, beef…),
+// and a time band (under 30 minutes…). Course and protein are chosen by the
+// model when a recipe is added — with a plain keyword fallback so a recipe
+// is never left uncategorised — and the cook can correct either one. The
+// time band is derived from prep + cook minutes wherever it is shown.
+
+export const COURSES = [
+  "Appetizers",
+  "Main Dishes",
+  "Side Dishes",
+  "Soups & Salads",
+  "Desserts",
+  "Breakfast",
+  "Snacks",
+  "Drinks",
+] as const;
+
+export const PROTEINS = [
+  "Poultry",
+  "Beef",
+  "Pork",
+  "Seafood",
+  "Lamb & Game",
+  "Vegetarian",
+  "Other",
+] as const;
+
+function timeBand(prepMinutes: number | null, cookMinutes: number | null): string | null {
+  const total = (prepMinutes ?? 0) + (cookMinutes ?? 0);
+  if (total <= 0) return null;
+  if (total < 30) return "Under 30 minutes";
+  if (total <= 60) return "30–60 minutes";
+  return "Over an hour";
+}
+
+function asCourse(v: string | null | undefined): string | null {
+  if (!v) return null;
+  const hit = COURSES.find((c) => c.toLowerCase() === v.trim().toLowerCase());
+  return hit ?? null;
+}
+
+function asProtein(v: string | null | undefined): string | null {
+  if (!v) return null;
+  const hit = PROTEINS.find((p) => p.toLowerCase() === v.trim().toLowerCase());
+  return hit ?? null;
+}
+
+// Deterministic fallback, used when the model is unavailable and to fill
+// categories on recipes saved before categorisation existed.
+function keywordCategories(title: string, ingredients: string[]): { course: string; protein: string } {
+  const hay = `${title} ${ingredients.join(" ")}`.toLowerCase();
+  const has = (...words: string[]) => words.some((w) => hay.includes(w));
+
+  let protein: string = "Other";
+  if (has("chicken", "turkey", "duck", "poultry", "cornish hen")) protein = "Poultry";
+  else if (has("shrimp", "prawn", "salmon", "tuna", "fish", "cod", "tilapia", "halibut", "crab", "scallop", "clam", "mussel", "oyster", "lobster", "anchov", "sea bass", "trout", "catfish", "seafood")) protein = "Seafood";
+  else if (has("beef", "steak", "brisket", "chuck roast", "ground beef", "veal")) protein = "Beef";
+  else if (has("pork", "bacon", "ham", "sausage", "kielbasa", "bratwurst", "salami", "pepperoni", "prosciutto", "pancetta", "chorizo")) protein = "Pork";
+  else if (has("lamb", "venison", "rabbit", "goat")) protein = "Lamb & Game";
+  else if (!has("meat", "broth", "stock", "gelatin")) protein = "Vegetarian";
+
+  const t = title.toLowerCase();
+  let course: string = "Main Dishes";
+  if (/\b(cake|cookie|brownie|pie|pudding|ice cream|sorbet|gelato|mousse|cheesecake|cobbler|crisp|custard|fudge|cupcake|tiramisu|panna cotta|trifle|dessert|sundae)\b/.test(t)) course = "Desserts";
+  else if (/\b(soup|salad|slaw|gazpacho|chowder|bisque|stew)\b/.test(t)) course = "Soups & Salads";
+  else if (/\b(pancake|waffle|omelet|omelette|frittata|french toast|breakfast|brunch|scrambled|quiche)\b/.test(t)) course = "Breakfast";
+  else if (/\b(dip|spread|bruschetta|crostini|appetizer|starter|hors d|pâté|pate|hummus|guacamole|salsa|wings|nachos|quesadilla|spring roll|deviled)\b/.test(t)) course = "Appetizers";
+  else if (/\b(smoothie|lemonade|cocktail|punch|shake|latte|mojito|margarita|sangria|drink)\b/.test(t)) course = "Drinks";
+  else if (/\b(side dish|rice pilaf|stuffing|coleslaw|glazed carrots|green beans|cornbread)\b/.test(t)) course = "Side Dishes";
+  else if (/\b(snack|granola|trail mix|popcorn|energy ball|bites)\b/.test(t)) course = "Snacks";
+
+  return { course, protein };
+}
+
+const categorizeSchema = z.object({
+  course: z.enum(COURSES),
+  protein: z.enum(PROTEINS),
+});
+
+// Picks the categories for a recipe being added. The model reads the title
+// and ingredients; if it is unavailable, keyword rules fill in so the
+// recipe still lands categorised. Never throws.
+async function autoCategorize(
+  ctx: Ctx,
+  input: { title: string; description: string; ingredients: string[]; prepMinutes: number | null; cookMinutes: number | null },
+): Promise<{ course: string; protein: string }> {
+  const fallback = keywordCategories(input.title, input.ingredients);
+  try {
+    const total = (input.prepMinutes ?? 0) + (input.cookMinutes ?? 0);
+    const result = await ctx.inference.complete(
+      [
+        `Recipe title: ${input.title}`,
+        input.description ? `Description: ${input.description}` : "",
+        total > 0 ? `Total time: about ${total} minutes.` : "",
+        "Ingredients:",
+        ...input.ingredients.slice(0, 40).map((i) => `- ${i}`),
+        "",
+        "Choose the single best course for this recipe (what part of a meal it is) and the single best protein/type (its main protein; Vegetarian when it has no meat or seafood).",
+      ].filter(Boolean).join("\n"),
+      { schema: categorizeSchema, system: "You categorise recipes for a home cookbook." },
+    );
+    return { course: result.course, protein: result.protein };
+  } catch {
+    return fallback;
+  }
+}
+
 async function toDto(ctx: Ctx, row: RecipeRow): Promise<z.infer<typeof recipeDto>> {
   const [dishPhotoUrl, scanPhotoUrl, sourcePhotoUrl] = await Promise.all([
     safePhotoUrl(ctx, row.dishPhotoKey),
@@ -96,6 +210,9 @@ async function toDto(ctx: Ctx, row: RecipeRow): Promise<z.infer<typeof recipeDto
     ingredients: parseJsonArray(row.ingredients),
     steps: parseJsonArray(row.steps),
     tags: parseJsonArray(row.tags),
+    course: row.course,
+    protein: row.protein,
+    timeTag: timeBand(row.prepMinutes, row.cookMinutes),
     sourceUrl: row.sourceUrl,
     sourceName: row.sourceName,
     collectionId: row.collectionId,
@@ -274,6 +391,15 @@ const inferenceDraftSchema = z.object({
   ingredients: z.array(z.string()),
   steps: z.array(z.string()),
   tags: z.array(z.string()),
+  course: z.enum(COURSES).nullable(),
+  protein: z.enum(PROTEINS).nullable(),
+});
+
+// The scanner also reports how the photographed page sits in the photo, so
+// a page photographed upside down or sideways can be turned right-side up
+// automatically (the client rotates the stored photo by this many degrees).
+const scanDraftSchema = inferenceDraftSchema.extend({
+  pageNeedsRotation: z.enum(["none", "90", "180", "270"]),
 });
 
 type InferenceDraft = z.infer<typeof inferenceDraftSchema>;
@@ -288,6 +414,8 @@ function cleanDraft(d: InferenceDraft) {
     ingredients: d.ingredients.map((s) => s.trim()).filter(Boolean),
     steps: d.steps.map((s) => s.trim()).filter(Boolean),
     tags: d.tags.map((s) => s.trim().toLowerCase()).filter(Boolean).slice(0, 8),
+    course: asCourse(d.course),
+    protein: asProtein(d.protein),
   };
 }
 
@@ -402,8 +530,11 @@ function guessAisle(name: string): string {
 // ---------- Jewel-Osco helpers (hoisted; used by the shop actions above) ----------
 
 // Jewel-Osco's official online ordering homepage — verified by opening it
-// (page title: "Grocery Delivery Near You - Order Groceries Online | Jewel-Osco").
-const JEWEL_URL = "http://jewelosco.com/";
+// (final URL https://www.jewelosco.com/, page title: "Grocery Delivery Near
+// You - Order Groceries Online | Jewel-Osco"). The https://www form matters:
+// the old http:// bare-domain link failed to open from inside the app on
+// Liz's phone, which is why the handoff "didn't work" for her.
+const JEWEL_URL = "https://www.jewelosco.com/";
 
 const jewelOrderDto = z.object({
   id: z.number(),
@@ -552,11 +683,19 @@ async function draftFromUrl(ctx: Ctx, url: string): Promise<DraftResponse> {
     if (typeof node.recipeCategory === "string") rawTags.push(node.recipeCategory);
     if (Array.isArray(node.recipeCategory)) rawTags.push(...node.recipeCategory.filter((x): x is string => typeof x === "string"));
     if (typeof node.recipeCuisine === "string") rawTags.push(node.recipeCuisine);
+    const title = asString(node.name) || "Untitled recipe";
+    const cats = await autoCategorize(ctx, {
+      title,
+      description: asString(node.description),
+      ingredients,
+      prepMinutes: prep,
+      cookMinutes: cook,
+    });
     return {
       ok: true,
       error: null,
       draft: {
-        title: asString(node.name) || "Untitled recipe",
+        title,
         description: asString(node.description),
         servings: servingsFrom(node),
         prepMinutes: prep,
@@ -564,6 +703,9 @@ async function draftFromUrl(ctx: Ctx, url: string): Promise<DraftResponse> {
         ingredients,
         steps,
         tags: rawTags.map((t) => t.trim().toLowerCase()).filter(Boolean).slice(0, 8),
+        course: cats.course,
+        protein: cats.protein,
+        pageNeedsRotation: "none",
         sourceUrl,
         sourceName: host || null,
         sourcePhotoKey,
@@ -594,6 +736,7 @@ async function draftFromUrl(ctx: Ctx, url: string): Promise<DraftResponse> {
       error: null,
       draft: {
         ...cleaned,
+        pageNeedsRotation: "none",
         sourceUrl,
         sourceName: host || null,
         sourcePhotoKey: null,
@@ -620,6 +763,9 @@ const draftResponse = z.object({
     ingredients: z.array(z.string()),
     steps: z.array(z.string()),
     tags: z.array(z.string()),
+    course: z.string().nullable(),
+    protein: z.string().nullable(),
+    pageNeedsRotation: z.enum(["none", "90", "180", "270"]),
     sourceUrl: z.string().nullable(),
     sourceName: z.string().nullable(),
     sourcePhotoKey: z.string().nullable(),
@@ -647,11 +793,24 @@ export const Actions = {
   }),
 
   createRecipe: defineAction({
-    description: "Saves a new recipe from a reviewed draft.",
+    description: "Saves a new recipe from a reviewed draft. Any category the draft is missing is chosen automatically.",
     request: z.object(draftShape),
     response: z.object({ id: z.number() }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
+      let course = asCourse(args.course);
+      let protein = asProtein(args.protein);
+      if (!course || !protein) {
+        const cats = await autoCategorize(ctx, {
+          title: args.title,
+          description: args.description,
+          ingredients: args.ingredients,
+          prepMinutes: args.prepMinutes,
+          cookMinutes: args.cookMinutes,
+        });
+        course = course ?? cats.course;
+        protein = protein ?? cats.protein;
+      }
       const inserted = await db.insert(schema.recipes).values({
         title: args.title.trim(),
         description: args.description,
@@ -661,6 +820,8 @@ export const Actions = {
         ingredients: JSON.stringify(args.ingredients.map((s) => s.trim()).filter(Boolean)),
         steps: JSON.stringify(args.steps.map((s) => s.trim()).filter(Boolean)),
         tags: JSON.stringify(args.tags.map((s) => s.trim().toLowerCase()).filter(Boolean)),
+        course,
+        protein,
         sourceUrl: args.sourceUrl,
         sourceName: args.sourceName,
         collectionId: args.collectionId,
@@ -683,6 +844,24 @@ export const Actions = {
     response: z.object({ ok: z.literal(true) }),
     async handler(ctx, args): Promise<{ ok: true }> {
       const db = ctx.db<typeof schema>();
+      // A partial update (like swapping the dish photo) may omit the
+      // categories — keep the stored ones rather than wiping them, and
+      // categorise only if the recipe somehow has none at all.
+      const existingRows = await db.select().from(schema.recipes).where(eq(schema.recipes.id, args.id));
+      const existing = existingRows[0];
+      let course = asCourse(args.course) ?? existing?.course ?? null;
+      let protein = asProtein(args.protein) ?? existing?.protein ?? null;
+      if (!course || !protein) {
+        const cats = await autoCategorize(ctx, {
+          title: args.title,
+          description: args.description,
+          ingredients: args.ingredients,
+          prepMinutes: args.prepMinutes,
+          cookMinutes: args.cookMinutes,
+        });
+        course = course ?? cats.course;
+        protein = protein ?? cats.protein;
+      }
       await db.update(schema.recipes).set({
         title: args.title.trim(),
         description: args.description,
@@ -692,6 +871,8 @@ export const Actions = {
         ingredients: JSON.stringify(args.ingredients.map((s) => s.trim()).filter(Boolean)),
         steps: JSON.stringify(args.steps.map((s) => s.trim()).filter(Boolean)),
         tags: JSON.stringify(args.tags.map((s) => s.trim().toLowerCase()).filter(Boolean)),
+        course,
+        protein,
         sourceUrl: args.sourceUrl,
         sourceName: args.sourceName,
         collectionId: args.collectionId,
@@ -745,6 +926,45 @@ export const Actions = {
         .where(eq(schema.recipes.id, args.id));
       ctx.invalidateQueries();
       return { ok: true };
+    },
+  }),
+
+  setCategories: defineAction({
+    description: "Corrects a recipe's automatic categories (course and protein) with the cook's own choice.",
+    request: z.object({
+      id: z.number().int(),
+      course: z.string().nullable(),
+      protein: z.string().nullable(),
+    }),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx, args): Promise<{ ok: true }> {
+      const db = ctx.db<typeof schema>();
+      await db.update(schema.recipes)
+        .set({ course: asCourse(args.course), protein: asProtein(args.protein), updatedAt: new Date() })
+        .where(eq(schema.recipes.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  backfillCategories: defineAction({
+    description: "Fills in course/protein categories on recipes saved before automatic categorisation existed, using keyword rules. Recipes that already have categories are untouched.",
+    request: z.object({}),
+    response: z.object({ updated: z.number() }),
+    async handler(ctx) {
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.recipes);
+      let updated = 0;
+      for (const row of rows) {
+        if (row.course && row.protein) continue;
+        const cats = keywordCategories(row.title, parseJsonArray(row.ingredients));
+        await db.update(schema.recipes)
+          .set({ course: row.course ?? cats.course, protein: row.protein ?? cats.protein })
+          .where(eq(schema.recipes.id, row.id));
+        updated++;
+      }
+      if (updated > 0) ctx.invalidateQueries();
+      return { updated };
     },
   }),
 
@@ -872,6 +1092,7 @@ export const Actions = {
           error: null,
           draft: {
             ...cleaned,
+            pageNeedsRotation: "none",
             sourceUrl: null,
             sourceName: null,
             sourcePhotoKey: null,
@@ -898,9 +1119,9 @@ export const Actions = {
       await ctx.blobs.put(key, bytes, { contentType: args.mimeType });
       try {
         const structured = await ctx.inference.complete(
-          "Read the recipe in this photo and return it structured. Transcribe quantities and steps exactly as written; if handwriting is unclear, make your best reading — the cook will check and fix it on the next screen.",
+          "Read the recipe in this photo and return it structured. Transcribe quantities and steps exactly as written; if handwriting is unclear, make your best reading — the cook will check and fix it on the next screen. Also judge how the page sits in the photo and report pageNeedsRotation: the clockwise rotation, in degrees, that would make the page right-side up ('none' if it already is).",
           {
-            schema: inferenceDraftSchema,
+            schema: scanDraftSchema,
             images: [{ dataBase64: args.dataBase64, mimeType: args.mimeType, caption: "Photo of a recipe page or card" }],
           },
         );
@@ -910,6 +1131,7 @@ export const Actions = {
           error: null,
           draft: {
             ...cleaned,
+            pageNeedsRotation: structured.pageNeedsRotation,
             sourceUrl: null,
             sourceName: "Scanned page",
             sourcePhotoKey: null,
@@ -930,6 +1152,9 @@ export const Actions = {
             ingredients: [],
             steps: [],
             tags: [],
+            course: null,
+            protein: null,
+            pageNeedsRotation: "none",
             sourceUrl: null,
             sourceName: "Scanned page",
             sourcePhotoKey: null,
@@ -1188,6 +1413,8 @@ export const Actions = {
         ingredients: z.array(z.string()),
         steps: z.array(z.string()),
         tags: z.array(z.string()),
+        course: z.string().nullable(),
+        protein: z.string().nullable(),
         sourceUrl: z.string().nullable(),
         sourceName: z.string().nullable(),
         collectionName: z.string().nullable(),
@@ -1217,6 +1444,8 @@ export const Actions = {
           ingredients: parseJsonArray(r.ingredients),
           steps: parseJsonArray(r.steps),
           tags: parseJsonArray(r.tags),
+          course: r.course,
+          protein: r.protein,
           sourceUrl: r.sourceUrl,
           sourceName: r.sourceName,
           collectionName: r.collectionId != null ? (collNames.get(r.collectionId) ?? null) : null,
@@ -1244,6 +1473,8 @@ export const Actions = {
         ingredients: z.array(z.string()).default([]),
         steps: z.array(z.string()).default([]),
         tags: z.array(z.string()).default([]),
+        course: z.string().nullable().default(null),
+        protein: z.string().nullable().default(null),
         sourceUrl: z.string().nullable().default(null),
         sourceName: z.string().nullable().default(null),
         collectionName: z.string().nullable().default(null),
@@ -1279,6 +1510,7 @@ export const Actions = {
         const titleKey = r.title.trim().toLowerCase();
         if (existingTitles.has(titleKey)) { skipped++; continue; }
         existingTitles.add(titleKey);
+        const cats = keywordCategories(r.title, r.ingredients);
         await db.insert(schema.recipes).values({
           title: r.title.trim(),
           description: r.description,
@@ -1288,6 +1520,8 @@ export const Actions = {
           ingredients: JSON.stringify(r.ingredients),
           steps: JSON.stringify(r.steps),
           tags: JSON.stringify(r.tags.map((t) => t.toLowerCase())),
+          course: asCourse(r.course) ?? cats.course,
+          protein: asProtein(r.protein) ?? cats.protein,
           sourceUrl: r.sourceUrl,
           sourceName: r.sourceName,
           collectionId: r.collectionName ? (collIdByName.get(r.collectionName.trim().toLowerCase()) ?? null) : null,
@@ -1464,6 +1698,101 @@ export const Actions = {
     },
   }),
 
+  checkForUpdate: defineAction({
+    description: "Checks the public Kitchen-Companion GitHub repo's version tags against the version this copy is running, and returns the latest version, its go-live time, and its What's-new notes (read from the repo's CHANGELOG.md at that tag — the same notes the app ships). Nothing is updated by this check; updating is always the user's choice.",
+    request: z.object({ currentVersion: z.string().min(1) }),
+    response: z.object({
+      status: z.enum(["up-to-date", "update-available", "unknown"]),
+      latestVersion: z.string().nullable(),
+      latestDate: z.string().nullable(),
+      currentDate: z.string().nullable(),
+      whatsNew: z.array(z.string()),
+      repoUrl: z.string(),
+      checkedAt: z.string(),
+    }),
+    async handler(ctx, args) {
+      const REPO_URL = "https://github.com/aruikis/Kitchen-Companion";
+      const base = { latestVersion: null, latestDate: null, currentDate: null, whatsNew: [] as string[], repoUrl: REPO_URL, checkedAt: new Date().toISOString() };
+      const parseVer = (s: string): [number, number, number] | null => {
+        const m = s.replace(/^v/i, "").match(/^(\d+)\.(\d+)\.(\d+)$/);
+        return m ? [parseInt(m[1] ?? "0", 10), parseInt(m[2] ?? "0", 10), parseInt(m[3] ?? "0", 10)] : null;
+      };
+      const cmp = (a: [number, number, number], b: [number, number, number]) =>
+        a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+      try {
+        const headers = { "User-Agent": UA, Accept: "application/vnd.github+json" };
+        const tagsRes = await fetch("https://api.github.com/repos/aruikis/Kitchen-Companion/tags?per_page=100", { headers });
+        if (!tagsRes.ok) return { status: "unknown" as const, ...base };
+        const tagsJson: unknown = await tagsRes.json();
+        if (!Array.isArray(tagsJson)) return { status: "unknown" as const, ...base };
+        type TagInfo = { name: string; ver: [number, number, number]; sha: string };
+        const tags: TagInfo[] = [];
+        for (const t of tagsJson) {
+          if (t && typeof t === "object") {
+            const o = t as Record<string, unknown>;
+            const commit = o.commit as Record<string, unknown> | undefined;
+            const ver = typeof o.name === "string" ? parseVer(o.name) : null;
+            if (ver && typeof o.name === "string" && typeof commit?.sha === "string") {
+              tags.push({ name: o.name, ver, sha: commit.sha });
+            }
+          }
+        }
+        if (tags.length === 0) return { status: "unknown" as const, ...base };
+        tags.sort((a, b) => cmp(b.ver, a.ver));
+        const latest = tags[0];
+        if (!latest) return { status: "unknown" as const, ...base };
+        const current = parseVer(args.currentVersion);
+        const commitDate = async (sha: string): Promise<string | null> => {
+          try {
+            const r = await fetch(`https://api.github.com/repos/aruikis/Kitchen-Companion/commits/${sha}`, { headers });
+            if (!r.ok) return null;
+            const j: unknown = await r.json();
+            const d = (j as { commit?: { committer?: { date?: unknown } } })?.commit?.committer?.date;
+            return typeof d === "string" ? d : null;
+          } catch {
+            return null;
+          }
+        };
+        const latestDate = await commitDate(latest.sha);
+        const currentTag = tags.find((t) => t.name.replace(/^v/i, "") === args.currentVersion.replace(/^v/i, ""));
+        const currentDate = currentTag ? await commitDate(currentTag.sha) : null;
+
+        let whatsNew: string[] = [];
+        if (current && cmp(latest.ver, current) > 0) {
+          try {
+            const raw = await fetch(`https://raw.githubusercontent.com/aruikis/Kitchen-Companion/${latest.name}/CHANGELOG.md`, { headers: { "User-Agent": UA } });
+            if (raw.ok) {
+              const md = await raw.text();
+              const section = md.split(/^##\s+/m).find((s) => s.trimStart().toLowerCase().startsWith(latest.name.toLowerCase()));
+              if (section) {
+                whatsNew = section
+                  .split("\n")
+                  .map((l) => l.trim())
+                  .filter((l) => l.startsWith("- "))
+                  .map((l) => l.slice(2).trim())
+                  .filter(Boolean)
+                  .slice(0, 8);
+              }
+            }
+          } catch {
+            whatsNew = [];
+          }
+        }
+        return {
+          status: (current && cmp(latest.ver, current) > 0 ? "update-available" : "up-to-date") as "up-to-date" | "update-available",
+          latestVersion: latest.name.replace(/^v/i, ""),
+          latestDate,
+          currentDate,
+          whatsNew,
+          repoUrl: REPO_URL,
+          checkedAt: new Date().toISOString(),
+        };
+      } catch {
+        return { status: "unknown" as const, ...base };
+      }
+    },
+  }),
+
   seedExamples: defineAction({
     description: "Pre-loads the two example recipes Anthony asked to ship in the box: sausage and sauerkraut with MASHED potatoes — kielbasa & sauerkraut served over buttery mashed potatoes (Half-Assed Homesteading's 'Rustic Kielbasa, Apple & Sauerkraut with Mashed Potatoes', the actual dish Anthony asked for, NOT a casserole) — and the top-rated homemade lasagna from Baker by Nature (4.99/5). Each is imported live through the normal import pipeline and tagged 'example'. Idempotent: any example already in the library is skipped, and a failed import is reported, never faked. Correction built in: the earlier seeded sausage example (Stockpiling Moms' Polish Sausage Casserole — the wrong dish, rejected by Anthony on-device) is removed and replaced when it is still in its untouched seeded state (example-tagged, never cooked, never favourited).",
     request: z.object({}),
@@ -1540,6 +1869,8 @@ export const Actions = {
           ingredients: JSON.stringify(d.ingredients),
           steps: JSON.stringify(splitSeedSteps(d.steps)),
           tags: JSON.stringify(tags),
+          course: d.course,
+          protein: d.protein,
           sourceUrl: d.sourceUrl,
           sourceName: d.sourceName,
           notes: ex.note,

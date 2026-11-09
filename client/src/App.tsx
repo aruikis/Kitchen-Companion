@@ -2,15 +2,17 @@ import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { SafeAreaTopScrim, bytesToBase64 } from "@hatch/space-sdk/client";
 import { api, type ApiResponse } from "./api";
+import { CHANGELOG, notesFor } from "./changelog";
 
 type Recipe = ApiResponse<typeof api, "listRecipes">["recipes"][number];
 type Collection = ApiResponse<typeof api, "listCollections">["collections"][number];
 type Draft = ApiResponse<typeof api, "importUrl">["draft"];
 type GroceryItem = ApiResponse<typeof api, "listGrocery">["items"][number];
 type JewelOrder = ApiResponse<typeof api, "getShop">["orders"][number];
+type UpdateInfo = ApiResponse<typeof api, "checkForUpdate">;
 type PlanEntry = ApiResponse<typeof api, "listPlan">["entries"][number];
 
-type Tab = "recipes" | "add" | "plan" | "shop";
+type Tab = "recipes" | "add" | "plan" | "shop" | "settings";
 type View =
   | { kind: "main" }
   | { kind: "recipe"; id: number }
@@ -100,17 +102,43 @@ function timersInStep(step: string): FoundTimer[] {
 }
 
 // Jewel-Osco's official online ordering homepage — verified by opening it
-// (page title: "Grocery Delivery Near You - Order Groceries Online | Jewel-Osco").
-const JEWEL_URL = "http://jewelosco.com/";
+// (final URL https://www.jewelosco.com/, page title: "Grocery Delivery Near
+// You - Order Groceries Online | Jewel-Osco"). Use the https://www form:
+// the old http:// link failed to open from inside the app.
+const JEWEL_URL = "https://www.jewelosco.com/";
 
 // Visible version (Anthony's standing rule: the UAT carries its version
 // number in the app, and the GitHub push of this build is tagged with it).
-const APP_VERSION = "1.1.0";
+const APP_VERSION = "1.2.0";
 
+// Automatic categories (chosen by the app when a recipe is added; the cook
+// can correct them). Mirrors the server's lists in actions.ts.
+const COURSES = ["Appetizers", "Main Dishes", "Side Dishes", "Soups & Salads", "Desserts", "Breakfast", "Snacks", "Drinks"] as const;
+const PROTEINS = ["Poultry", "Beef", "Pork", "Seafood", "Lamb & Game", "Vegetarian", "Other"] as const;
+const TIME_BANDS = ["Under 30 minutes", "30–60 minutes", "Over an hour"] as const;
+
+// Copy that works inside the app frame: the clipboard API first, then the
+// older selection-based copy as a fallback. Returns false only when both
+// are unavailable — callers then show the text on screen to copy by hand.
 async function copyText(text: string): Promise<boolean> {
   try {
     await navigator.clipboard.writeText(text);
     return true;
+  } catch {
+    // fall through to the legacy path
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
   } catch {
     return false;
   }
@@ -148,29 +176,130 @@ function recipeShareText(r: Recipe): string {
   return lines.join("\n");
 }
 
-/** Downscales a photo to a JPEG (max 1600px) and returns base64 — the size the scanner works best with. */
-async function photoToBase64(file: File): Promise<{ dataBase64: string; mimeType: "image/jpeg" | "image/png"; previewUrl: string }> {
-  const previewUrl = URL.createObjectURL(file);
-  if (file.type === "image/png" && file.size < 1_500_000) {
-    const buf = new Uint8Array(await file.arrayBuffer());
-    return { dataBase64: bytesToBase64(buf), mimeType: "image/png", previewUrl };
+/** Reads the EXIF orientation tag (1–8) from a JPEG's bytes; 1 (upright) when absent or unreadable. */
+async function readExifOrientation(file: File): Promise<number> {
+  try {
+    if (!/jpe?g/i.test(file.type) && !/\.jpe?g$/i.test(file.name)) return 1;
+    const buf = new Uint8Array(await file.slice(0, 128 * 1024).arrayBuffer());
+    if (buf.length < 4 || buf[0] !== 0xff || buf[1] !== 0xd8) return 1;
+    let offset = 2;
+    while (offset + 4 <= buf.length) {
+      if (buf[offset] !== 0xff) return 1;
+      const marker = buf[offset + 1] ?? 0;
+      if (marker === 0xda || marker === 0xd9) return 1; // start of scan / end — no EXIF beyond here
+      const len = ((buf[offset + 2] ?? 0) << 8) + (buf[offset + 3] ?? 0);
+      if (len < 2) return 1;
+      if (marker === 0xe1) {
+        // APP1 — check for the "Exif\0\0" header
+        const p = offset + 4;
+        if (buf[p] === 0x45 && buf[p + 1] === 0x78 && buf[p + 2] === 0x69 && buf[p + 3] === 0x66 && buf[p + 4] === 0 && buf[p + 5] === 0) {
+          const tiff = p + 6;
+          const le = buf[tiff] === 0x49 && buf[tiff + 1] === 0x49;
+          const u16 = (o: number) => (le ? (buf[o] ?? 0) + ((buf[o + 1] ?? 0) << 8) : ((buf[o] ?? 0) << 8) + (buf[o + 1] ?? 0));
+          const u32 = (o: number) =>
+            le
+              ? (buf[o] ?? 0) + ((buf[o + 1] ?? 0) << 8) + ((buf[o + 2] ?? 0) << 16) + ((buf[o + 3] ?? 0) << 24)
+              : ((buf[o] ?? 0) << 24) + ((buf[o + 1] ?? 0) << 16) + ((buf[o + 2] ?? 0) << 8) + (buf[o + 3] ?? 0);
+          if (tiff + 8 > buf.length) return 1;
+          const ifd = tiff + u32(tiff + 4);
+          if (ifd + 2 > buf.length) return 1;
+          const count = u16(ifd);
+          for (let i = 0; i < count; i++) {
+            const entry = ifd + 2 + i * 12;
+            if (entry + 12 > buf.length) break;
+            if (u16(entry) === 0x0112) {
+              const v = u16(entry + 8);
+              return v >= 1 && v <= 8 ? v : 1;
+            }
+          }
+          return 1;
+        }
+      }
+      offset += 2 + len;
+    }
+    return 1;
+  } catch {
+    return 1;
   }
-  const img = new Image();
-  await new Promise<void>((resolve, reject) => {
-    img.onload = () => resolve();
-    img.onerror = () => reject(new Error("image load failed"));
-    img.src = previewUrl;
-  });
-  const max = 1600;
-  const scale = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
-  const canvas = document.createElement("canvas");
-  canvas.width = Math.round(img.naturalWidth * scale);
-  canvas.height = Math.round(img.naturalHeight * scale);
-  const ctx2d = canvas.getContext("2d");
-  if (!ctx2d) throw new Error("canvas unavailable");
-  ctx2d.drawImage(img, 0, 0, canvas.width, canvas.height);
-  const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
-  return { dataBase64: dataUrl.split(",")[1] ?? "", mimeType: "image/jpeg", previewUrl };
+}
+
+type LoadedPhoto = { dataBase64: string; mimeType: "image/jpeg" | "image/png"; previewUrl: string };
+
+async function drawPhoto(file: File, extraQuarterTurns: number): Promise<LoadedPhoto> {
+  const srcUrl = URL.createObjectURL(file);
+  try {
+    const img = new Image();
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error("image load failed"));
+      img.src = srcUrl;
+    });
+    const orientation = await readExifOrientation(file);
+    // What the EXIF tag demands, in clockwise quarter turns + a mirror flag.
+    const exifTurns = orientation === 3 || orientation === 4 ? 2 : orientation === 5 || orientation === 6 ? 1 : orientation === 7 || orientation === 8 ? 3 : 0;
+    const exifMirrored = orientation === 2 || orientation === 4 || orientation === 5 || orientation === 7;
+    // Did this viewer already apply the EXIF turn when decoding? Compare
+    // the <img> decode against a raw decode (imageOrientation:'none'):
+    // differing dimensions mean the <img> pixels are already turned, so
+    // the tag must not be applied twice. Where raw decode is unavailable,
+    // modern browsers apply EXIF in <img>, so assume it was applied.
+    let viewerAppliedExif = true;
+    try {
+      const bmp = await createImageBitmap(file, { imageOrientation: "none" });
+      viewerAppliedExif = bmp.width !== img.naturalWidth || bmp.height !== img.naturalHeight;
+      bmp.close();
+    } catch {
+      viewerAppliedExif = true;
+    }
+
+    const turns = (((viewerAppliedExif ? 0 : exifTurns) + extraQuarterTurns) % 4 + 4) % 4;
+    const mirrored = viewerAppliedExif ? false : exifMirrored;
+
+    const max = 1600;
+    const scale = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+    const drawW = Math.round(img.naturalWidth * scale);
+    const drawH = Math.round(img.naturalHeight * scale);
+    const swap = turns % 2 === 1;
+    const canvas = document.createElement("canvas");
+    canvas.width = swap ? drawH : drawW;
+    canvas.height = swap ? drawW : drawH;
+    const c = canvas.getContext("2d");
+    if (!c) throw new Error("canvas unavailable");
+    c.translate(canvas.width / 2, canvas.height / 2);
+    c.rotate((turns * Math.PI) / 2);
+    if (mirrored) c.scale(-1, 1);
+    c.drawImage(img, -drawW / 2, -drawH / 2, drawW, drawH);
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+    return { dataBase64: dataUrl.split(",")[1] ?? "", mimeType: "image/jpeg", previewUrl: dataUrl };
+  } finally {
+    URL.revokeObjectURL(srcUrl);
+  }
+}
+
+/**
+ * Prepares an uploaded photo: right-side up and sensibly sized.
+ * The photo's own EXIF orientation is applied so an upside-down or sideways
+ * shot is stored upright; `extraQuarterTurns` adds a further clockwise
+ * quarter-turn (used when the scanner reports the page itself was turned).
+ */
+async function photoToBase64(file: File, extraQuarterTurns = 0): Promise<LoadedPhoto> {
+  if (extraQuarterTurns === 0 && file.type === "image/png" && file.size < 1_500_000) {
+    const orientation = await readExifOrientation(file); // PNGs: almost always 1; cheap guard
+    if (orientation === 1) {
+      const previewUrl = URL.createObjectURL(file);
+      const buf = new Uint8Array(await file.arrayBuffer());
+      return { dataBase64: bytesToBase64(buf), mimeType: "image/png", previewUrl };
+    }
+  }
+  return drawPhoto(file, extraQuarterTurns);
+}
+
+/** Rotates an already-prepared photo a further 90° clockwise (the scanner's fix-up pass). */
+async function rotateLoadedPhoto(photo: LoadedPhoto): Promise<LoadedPhoto> {
+  const res = await fetch(photo.previewUrl);
+  const blob = await res.blob();
+  const file = new File([blob], "photo.jpg", { type: "image/jpeg" });
+  return drawPhoto(file, 1);
 }
 
 async function fileToRawBase64(file: File): Promise<string> {
@@ -338,6 +467,16 @@ export function App() {
 
   const recipesQ = useQuery({ queryKey: ["recipes"], queryFn: () => api.listRecipes({}) });
   const collectionsQ = useQuery({ queryKey: ["collections"], queryFn: () => api.listCollections({}) });
+  // On open, check the public GitHub repo (the distribution channel) for a
+  // newer version. Checking never changes anything — updating is a choice
+  // made in Settings.
+  const updateQ = useQuery({
+    queryKey: ["update-check"],
+    queryFn: () => api.checkForUpdate({ currentVersion: APP_VERSION }),
+    staleTime: 1000 * 60 * 60,
+    retry: false,
+  });
+  const updateInfo: UpdateInfo | null = updateQ.data ?? null;
   const recipes = recipesQ.data?.recipes ?? [];
   const collections = collectionsQ.data?.collections ?? [];
 
@@ -367,6 +506,9 @@ export function App() {
                   ingredients: r.ingredients,
                   steps: r.steps,
                   tags: r.tags,
+                  course: r.course,
+                  protein: r.protein,
+                  pageNeedsRotation: "none",
                   sourceUrl: r.sourceUrl,
                   sourceName: r.sourceName,
                   sourcePhotoKey: r.sourcePhotoKey,
@@ -397,6 +539,8 @@ export function App() {
             collections={collections}
             loading={recipesQ.isPending}
             error={recipesQ.error ? String(recipesQ.error) : null}
+            updateInfo={updateInfo}
+            onOpenSettings={() => setTab("settings")}
             onOpen={openRecipe}
             onAdd={() => setTab("add")}
           />
@@ -404,8 +548,10 @@ export function App() {
           <AddRecipe onReview={openReview} />
         ) : tab === "plan" ? (
           <Planner recipes={recipes} onOpen={openRecipe} />
-        ) : (
+        ) : tab === "shop" ? (
           <GroceryList />
+        ) : (
+          <SettingsView updateInfo={updateInfo} checking={updateQ.isFetching} onRecheck={() => updateQ.refetch()} />
         )}
       </main>
 
@@ -415,13 +561,14 @@ export function App() {
           style={{ background: "var(--surface)", borderColor: "var(--border)" }}
           aria-label="Main"
         >
-          <div className="mx-auto grid max-w-3xl grid-cols-4">
+          <div className="mx-auto grid max-w-3xl grid-cols-5">
             {(
               [
                 ["recipes", "📖", "Recipes"],
                 ["add", "＋", "Add"],
                 ["plan", "🗓", "Plan"],
                 ["shop", "🛒", "Shop"],
+                ["settings", "⚙️", "Settings"],
               ] as Array<[Tab, string, string]>
             ).map(([key, icon, label]) => (
               <button
@@ -448,24 +595,55 @@ export function App() {
 type Filter = "all" | "favorites" | "want" | "made";
 
 function Library({
-  recipes, collections, loading, error, onOpen, onAdd,
+  recipes, collections, loading, error, updateInfo, onOpenSettings, onOpen, onAdd,
 }: {
   recipes: Recipe[];
   collections: Collection[];
   loading: boolean;
   error: string | null;
+  updateInfo: UpdateInfo | null;
+  onOpenSettings: () => void;
   onOpen: (id: number) => void;
   onAdd: () => void;
 }) {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
   const [collectionId, setCollectionId] = useState<number | null>(null);
+  const [courseFilter, setCourseFilter] = useState<string | null>(null);
+  const [proteinFilter, setProteinFilter] = useState<string | null>(null);
+  const [timeFilter, setTimeFilter] = useState<string | null>(null);
   const [fridge, setFridge] = useState("");
   const queryClient = useQueryClient();
   const favMut = useMutation({
     mutationFn: (args: { id: number; favorite: boolean }) => api.setFavorite(args),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["recipes"] }),
   });
+
+  // Recipes saved before automatic categories existed get theirs filled in
+  // once, silently, the first time the library opens with any missing.
+  const backfilledRef = useRef(false);
+  useEffect(() => {
+    if (backfilledRef.current) return;
+    if (recipes.some((r) => !r.course || !r.protein)) {
+      backfilledRef.current = true;
+      api.backfillCategories({})
+        .then(() => queryClient.invalidateQueries({ queryKey: ["recipes"] }))
+        .catch(() => { /* categories fill in on a later open */ });
+    }
+  }, [recipes, queryClient]);
+
+  const coursesPresent = useMemo(
+    () => COURSES.filter((c) => recipes.some((r) => r.course === c)),
+    [recipes],
+  );
+  const proteinsPresent = useMemo(
+    () => PROTEINS.filter((p) => recipes.some((r) => r.protein === p)),
+    [recipes],
+  );
+  const timesPresent = useMemo(
+    () => TIME_BANDS.filter((t) => recipes.some((r) => r.timeTag === t)),
+    [recipes],
+  );
 
   const fridgeTokens = useMemo(
     () => fridge.split(/[,\n]/).map((t) => t.trim().toLowerCase()).filter(Boolean),
@@ -478,6 +656,9 @@ function Library({
     if (filter === "want") list = list.filter((r) => r.status === "want");
     if (filter === "made") list = list.filter((r) => r.status === "made");
     if (collectionId != null) list = list.filter((r) => r.collectionId === collectionId);
+    if (courseFilter) list = list.filter((r) => r.course === courseFilter);
+    if (proteinFilter) list = list.filter((r) => r.protein === proteinFilter);
+    if (timeFilter) list = list.filter((r) => r.timeTag === timeFilter);
     const q = query.trim().toLowerCase();
     if (q) {
       list = list.filter(
@@ -499,7 +680,7 @@ function Library({
         .map((s) => ({ ...s.r, fridgeHits: s.hits }));
     }
     return list.map((r) => ({ ...r, fridgeHits: 0 }));
-  }, [recipes, filter, collectionId, query, fridgeTokens]);
+  }, [recipes, filter, collectionId, courseFilter, proteinFilter, timeFilter, query, fridgeTokens]);
 
   return (
     <div>
@@ -509,6 +690,22 @@ function Library({
           ? "Your own cookbook — every recipe you save lives here, not on a pin board."
           : `${recipes.length} recipe${recipes.length === 1 ? "" : "s"} saved`}
       </p>
+
+      {updateInfo?.status === "update-available" && (
+        <button
+          type="button"
+          onClick={onOpenSettings}
+          className="mt-3 w-full rounded-[var(--radius)] px-4 py-3 text-left"
+          style={{ background: "var(--surface)", border: "1px solid var(--herb)" }}
+        >
+          <span className="text-sm font-bold" style={{ color: "var(--herb)" }}>
+            ⬆️ Update available — Kitchen Companion v{updateInfo.latestVersion}
+          </span>
+          <span className="mt-0.5 block text-sm" style={{ color: "var(--dim)" }}>
+            See what’s new in Settings and update when you’re ready. Nothing changes until you choose it.
+          </span>
+        </button>
+      )}
 
       <div className="mt-4">
         <label htmlFor="recipe-search" className="sr-only">Search your recipes</label>
@@ -534,6 +731,35 @@ function Library({
           </Chip>
         ))}
       </div>
+
+      {(coursesPresent.length > 0 || proteinsPresent.length > 0 || timesPresent.length > 0) && (
+        <div className="mt-1 space-y-1.5" aria-label="Category filters">
+          {coursesPresent.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-xs font-semibold" style={{ color: "var(--dim)" }}>Course</span>
+              {coursesPresent.map((c) => (
+                <Chip key={c} active={courseFilter === c} onClick={() => setCourseFilter(courseFilter === c ? null : c)}>{c}</Chip>
+              ))}
+            </div>
+          )}
+          {proteinsPresent.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-xs font-semibold" style={{ color: "var(--dim)" }}>Protein</span>
+              {proteinsPresent.map((p) => (
+                <Chip key={p} active={proteinFilter === p} onClick={() => setProteinFilter(proteinFilter === p ? null : p)}>{p}</Chip>
+              ))}
+            </div>
+          )}
+          {timesPresent.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-xs font-semibold" style={{ color: "var(--dim)" }}>Time</span>
+              {timesPresent.map((t) => (
+                <Chip key={t} active={timeFilter === t} onClick={() => setTimeFilter(timeFilter === t ? null : t)}>{t}</Chip>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       <details className="mt-2 rounded-[var(--radius)] px-4 py-3" style={{ background: "var(--surface)", border: "1px solid var(--border)" }}>
         <summary className="cursor-pointer text-sm font-semibold">🥬 What’s in my fridge?</summary>
@@ -608,6 +834,11 @@ function Library({
                     {total ? `${total} min` : ""}
                     {r.servings ? `${total ? " · " : ""}serves ${r.servings}` : ""}
                   </p>
+                  {(r.course || r.protein) && (
+                    <p className="mt-0.5 text-xs font-medium" style={{ color: "var(--herb)" }}>
+                      {[r.course, r.protein].filter(Boolean).join(" · ")}
+                    </p>
+                  )}
                   {r.fridgeHits > 0 && (
                     <p className="mt-1 text-xs font-semibold" style={{ color: "var(--herb)" }}>
                       Uses {r.fridgeHits} of your fridge items
@@ -647,14 +878,9 @@ function Library({
         >
           <summary className="cursor-pointer text-sm font-semibold">What’s new in {APP_VERSION}</summary>
           <ul className="mt-2 list-disc space-y-1 pl-5 text-sm" style={{ color: "var(--dim)" }}>
-            <li>
-              Photos load properly now. One bad photo link can no longer stop the whole library from
-              loading, and a photo that fails shows a placeholder instead of a broken image.
-            </li>
-            <li>
-              The sausage example is the real dish now: kielbasa and sauerkraut served over mashed
-              potatoes. The Polish sausage casserole that was shipped by mistake has been replaced.
-            </li>
+            {(notesFor(APP_VERSION)?.notes ?? []).map((n) => (
+              <li key={n}>{n}</li>
+            ))}
           </ul>
         </details>
       </footer>
@@ -738,6 +964,102 @@ function BackupBar({ recipes, collections }: { recipes: Recipe[]; collections: C
   );
 }
 
+// ---------- Jewel-Osco handoff (shared by the recipe page and Shop tab) ----------
+// Jewel-Osco gives no app a way into its checkout, so this panel is the
+// whole handoff, in plain steps: copy the list, open Jewel-Osco, sign in
+// there, add each item, and pay there. If copying is unavailable in this
+// browser, the list is shown on screen to copy by hand — never a dead end.
+
+function JewelHandoff({
+  order, jewelUrl, onOrdered, ordering, extra,
+}: {
+  order: JewelOrder;
+  jewelUrl: string;
+  onOrdered?: () => void;
+  ordering?: boolean;
+  extra?: React.ReactNode;
+}) {
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+  const doCopy = async () => {
+    const ok = await copyText(order.cartText);
+    setCopyState(ok ? "copied" : "failed");
+  };
+  return (
+    <div>
+      <ol className="list-decimal space-y-1 pl-5 text-sm" style={{ color: "var(--dim)" }}>
+        <li>
+          <strong style={{ color: "var(--text)" }}>Copy your list</strong> (button below) — {order.itemCount} item{order.itemCount === 1 ? "" : "s"}.
+        </li>
+        <li>
+          <strong style={{ color: "var(--text)" }}>Open Jewel-Osco and sign in there.</strong> Your Jewel password never goes into this app.
+        </li>
+        <li>
+          <strong style={{ color: "var(--text)" }}>Add each item and check out on Jewel-Osco.</strong> Jewel doesn’t let any app fill your cart for you, so the copied list is what carries over — search each item there and add it, then pay as usual.
+        </li>
+      </ol>
+      <ul className="mt-3 max-h-56 space-y-1 overflow-y-auto rounded-lg px-3 py-2 text-sm" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
+        {order.items.map((i, idx) => (
+          <li key={idx}>{i.detail && <span className="font-semibold">{i.detail} </span>}{i.name}</li>
+        ))}
+      </ul>
+      <div className="mt-3 flex flex-wrap gap-2">
+        <button
+          type="button"
+          onClick={doCopy}
+          className="rounded-full px-4 py-2 text-sm font-bold"
+          style={{ background: "var(--herb)", color: "#10240c" }}
+        >
+          {copyState === "copied" ? "✓ List copied" : "📋 Copy the list"}
+        </button>
+        <a
+          href={jewelUrl}
+          target="_blank"
+          rel="noreferrer"
+          className="rounded-full px-4 py-2 text-sm font-bold"
+          style={{ background: "var(--accent)", color: "var(--accent-ink)" }}
+        >
+          Open Jewel-Osco ↗
+        </a>
+        {onOrdered && (
+          <button
+            type="button"
+            disabled={ordering}
+            onClick={onOrdered}
+            className="rounded-full px-4 py-2 text-sm font-semibold disabled:opacity-50"
+            style={{ background: "var(--surface)", border: "1px solid var(--herb)", color: "var(--herb)" }}
+          >
+            ✓ I ordered this at Jewel-Osco
+          </button>
+        )}
+        {extra}
+      </div>
+      {copyState === "copied" && (
+        <p className="mt-2 text-sm" style={{ color: "var(--herb)" }} role="status">
+          Copied — it’s on your clipboard. On Jewel-Osco’s site, search each item and add it to your cart.
+        </p>
+      )}
+      {copyState === "failed" && (
+        <div className="mt-2" role="status">
+          <p className="text-sm font-medium" style={{ color: "var(--accent)" }}>
+            Copying isn’t available in this browser — no problem, here’s the list to copy by hand:
+          </p>
+          <label htmlFor={`cart-text-${order.id}`} className="sr-only">Your Jewel-Osco list as text</label>
+          <textarea
+            id={`cart-text-${order.id}`}
+            readOnly
+            value={order.cartText}
+            rows={Math.min(10, order.itemCount + 3)}
+            onFocus={(e) => e.target.select()}
+            className="mt-1 w-full rounded-lg px-3 py-2 text-sm outline-none"
+            style={{ background: "var(--surface2)", border: "1px solid var(--border)", color: "var(--text)" }}
+          />
+          <p className="mt-1 text-xs" style={{ color: "var(--dim)" }}>Tap the box, select all, and copy — then paste it wherever you keep lists, or read it off the screen at Jewel-Osco.</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ---------- recipe detail + cook mode ----------
 
 function RecipeDetail({
@@ -760,6 +1082,9 @@ function RecipeDetail({
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [planDate, setPlanDate] = useState(localDateStr(new Date()));
   const [planMeal, setPlanMeal] = useState<"breakfast" | "lunch" | "dinner" | "other">("dinner");
+  const [catEditing, setCatEditing] = useState(false);
+  const [catCourse, setCatCourse] = useState<string | null>(null);
+  const [catProtein, setCatProtein] = useState<string | null>(null);
   const timers = useTimers();
   const dishInputRef = useRef<HTMLInputElement>(null);
 
@@ -787,17 +1112,23 @@ function RecipeDetail({
     onSuccess: (res) => setNotice(res.added > 0 ? `Added ${res.added} item${res.added === 1 ? "" : "s"} to your shopping list.` : "Those ingredients are already on your shopping list."),
   });
   const [jewelOrder, setJewelOrder] = useState<JewelOrder | null>(null);
+  const [jewelError, setJewelError] = useState<string | null>(null);
   const jewelMut = useMutation({
     mutationFn: api.buildJewelCart,
     onSuccess: (res) => {
       if (res.ok && res.order) {
         setJewelOrder(res.order);
+        setJewelError(null);
         queryClient.invalidateQueries({ queryKey: ["shop"] });
       } else {
-        setNotice(res.error ?? "That cart could not be built.");
+        setJewelError(res.error ?? "That list could not be built.");
       }
     },
-    onError: () => setNotice("That cart could not be built. Try again from the Shop tab."),
+    onError: () => setJewelError("The Jewel-Osco list could not be built just now. Check your connection and tap the button again — nothing was lost."),
+  });
+  const catMut = useMutation({
+    mutationFn: api.setCategories,
+    onSuccess: invalidate,
   });
   const planMut = useMutation({
     mutationFn: api.addPlanEntry,
@@ -812,6 +1143,9 @@ function RecipeDetail({
     setTargetServings(recipe?.servings ?? null);
     setCheckedIng(new Set());
     setCheckedSteps(new Set());
+    setCatCourse(recipe?.course ?? null);
+    setCatProtein(recipe?.protein ?? null);
+    setCatEditing(false);
     // reset per recipe
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [recipeId]);
@@ -825,7 +1159,6 @@ function RecipeDetail({
     );
   }
 
-  const baseServings = recipe.servings ?? targetServings ?? 1;
   const shownServings = targetServings ?? recipe.servings ?? 1;
   const factor = recipe.servings ? shownServings / recipe.servings : 1;
   const heroPhoto = recipe.dishPhotoUrl ?? recipe.sourcePhotoUrl;
@@ -846,6 +1179,8 @@ function RecipeDetail({
         ingredients: recipe.ingredients,
         steps: recipe.steps,
         tags: recipe.tags,
+        course: recipe.course,
+        protein: recipe.protein,
         sourceUrl: recipe.sourceUrl,
         sourceName: recipe.sourceName,
         collectionId: recipe.collectionId,
@@ -934,6 +1269,59 @@ function RecipeDetail({
         </div>
       )}
 
+      <div className="mt-3 rounded-[var(--radius)] px-3 py-2.5" style={{ background: "var(--surface)", border: "1px solid var(--border)" }}>
+        <div className="flex flex-wrap items-center gap-1.5 text-xs">
+          <span className="font-semibold" style={{ color: "var(--dim)" }}>Categories:</span>
+          {[recipe.course, recipe.protein, recipe.timeTag].filter(Boolean).map((c) => (
+            <span key={c as string} className="rounded-full px-2.5 py-1 font-semibold" style={{ background: "var(--surface2)", border: "1px solid var(--herb)", color: "var(--text)" }}>
+              {c}
+            </span>
+          ))}
+          {!catEditing && (
+            <button type="button" onClick={() => setCatEditing(true)} className="ml-1 font-semibold underline" style={{ color: "var(--accent)" }}>
+              Fix a category
+            </button>
+          )}
+        </div>
+        {catEditing && (
+          <div className="mt-2 space-y-2">
+            <div>
+              <span className="text-xs font-semibold" id="cat-course-label" style={{ color: "var(--dim)" }}>Course</span>
+              <div className="mt-1 flex flex-wrap gap-1.5" role="group" aria-labelledby="cat-course-label">
+                {COURSES.map((c) => (
+                  <Chip key={c} active={catCourse === c} onClick={() => setCatCourse(c)}>{c}</Chip>
+                ))}
+              </div>
+            </div>
+            <div>
+              <span className="text-xs font-semibold" id="cat-protein-label" style={{ color: "var(--dim)" }}>Protein / type</span>
+              <div className="mt-1 flex flex-wrap gap-1.5" role="group" aria-labelledby="cat-protein-label">
+                {PROTEINS.map((p) => (
+                  <Chip key={p} active={catProtein === p} onClick={() => setCatProtein(p)}>{p}</Chip>
+                ))}
+              </div>
+            </div>
+            <p className="text-xs" style={{ color: "var(--dim)" }}>
+              Time ({recipe.timeTag ?? "not set"}) follows the recipe’s prep + cook minutes — change those in Edit recipe and the time category follows.
+            </p>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                disabled={catMut.isPending}
+                onClick={() => catMut.mutate({ id: recipe.id, course: catCourse, protein: catProtein }, { onSuccess: () => setCatEditing(false) })}
+                className="rounded-full px-4 py-1.5 text-sm font-semibold disabled:opacity-50"
+                style={{ background: "var(--herb)", color: "#10240c" }}
+              >
+                Save categories
+              </button>
+              <button type="button" onClick={() => setCatEditing(false)} className="rounded-full px-4 py-1.5 text-sm font-semibold" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
       {recipe.sourceUrl && (
         <p className="mt-3 text-sm">
           <a href={recipe.sourceUrl} target="_blank" rel="noreferrer" className="font-semibold underline" style={{ color: "var(--accent)" }}>
@@ -991,40 +1379,29 @@ function RecipeDetail({
           className="col-span-2 rounded-full py-3 text-base font-bold disabled:opacity-50"
           style={{ background: "var(--herb)", color: "#10240c" }}
         >
-          {jewelMut.isPending ? "Building your Jewel-Osco cart…" : "🛒 Shop this recipe at Jewel-Osco"}
+          {jewelMut.isPending ? "Building your Jewel-Osco list…" : "🛒 Shop this recipe at Jewel-Osco"}
         </button>
       </div>
 
+      {jewelError && !jewelOrder && (
+        <p className="mt-3 rounded-[var(--radius)] px-4 py-3 text-sm font-medium" style={{ background: "var(--surface)", border: "1px solid var(--accent)" }} role="alert">
+          {jewelError}
+        </p>
+      )}
+
       {jewelOrder && (
         <div className="mt-3 rounded-[var(--radius)] px-4 py-3" style={{ background: "var(--surface)", border: "1px solid var(--herb)" }} role="status">
-          <p className="text-sm font-semibold">Your {jewelOrder.storeName} cart is built — {jewelOrder.itemCount} item{jewelOrder.itemCount === 1 ? "" : "s"} for {shownServings} serving{shownServings === 1 ? "" : "s"}.</p>
-          <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
-            Jewel-Osco checkout happens on Jewel-Osco’s own site, in your own account — you sign in there and pay there. Take the cart with you:
-          </p>
-          <div className="mt-2 flex flex-wrap gap-2">
-            <a
-              href={JEWEL_URL}
-              target="_blank"
-              rel="noreferrer"
-              className="rounded-full px-4 py-2 text-sm font-bold"
-              style={{ background: "var(--accent)", color: "var(--accent-ink)" }}
-            >
-              Open Jewel-Osco ↗
-            </a>
-            <button
-              type="button"
-              onClick={async () => {
-                const res = await copyText(jewelOrder.cartText);
-                setNotice(res ? "Cart copied — paste it into Jewel-Osco search, item by item." : "Copying is not available here right now.");
-              }}
-              className="rounded-full px-4 py-2 text-sm font-semibold"
-              style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}
-            >
-              Copy the cart
-            </button>
-            <button type="button" onClick={onGoShop} className="rounded-full px-4 py-2 text-sm font-semibold" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
-              See it on the Shop tab →
-            </button>
+          <p className="text-sm font-semibold">Your {jewelOrder.storeName} list is ready — {jewelOrder.itemCount} item{jewelOrder.itemCount === 1 ? "" : "s"} for {shownServings} serving{shownServings === 1 ? "" : "s"}.</p>
+          <div className="mt-2">
+            <JewelHandoff
+              order={jewelOrder}
+              jewelUrl={JEWEL_URL}
+              extra={(
+                <button type="button" onClick={onGoShop} className="rounded-full px-4 py-2 text-sm font-semibold" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
+                  See it on the Shop tab →
+                </button>
+              )}
+            />
           </div>
         </div>
       )}
@@ -1368,9 +1745,21 @@ function AddRecipe({ onReview }: { onReview: (draft: NonNullable<Draft>, editing
     setError(null);
     setBusy("Reading your photo…");
     try {
-      const { dataBase64, mimeType, previewUrl } = await photoToBase64(file);
-      const res = await api.scanImage({ dataBase64, mimeType });
-      if (res.draft) onReview(res.draft, null, previewUrl);
+      let photo = await photoToBase64(file);
+      const res = await api.scanImage({ dataBase64: photo.dataBase64, mimeType: photo.mimeType });
+      // The page itself may sit turned in the photo (beyond what the photo's
+      // own orientation data explains). The scanner reports the turn, and
+      // the photo is rotated right-side up and stored that way — Liz never
+      // has to fix rotation by hand.
+      let draft = res.draft;
+      if (draft && draft.pageNeedsRotation !== "none") {
+        const turns = draft.pageNeedsRotation === "90" ? 1 : draft.pageNeedsRotation === "180" ? 2 : 3;
+        setBusy("Straightening the photo…");
+        for (let i = 0; i < turns; i++) photo = await rotateLoadedPhoto(photo);
+        const stored = await api.storePhoto({ dataBase64: photo.dataBase64, mimeType: photo.mimeType, kind: "scan" });
+        draft = { ...draft, scanPhotoKey: stored.key, pageNeedsRotation: "none" };
+      }
+      if (draft) onReview(draft, null, photo.previewUrl);
       else setError(res.error ?? "The photo could not be read.");
     } catch {
       setError("That photo could not be read. Try again in good light, holding the page flat.");
@@ -1415,6 +1804,9 @@ function AddRecipe({ onReview }: { onReview: (draft: NonNullable<Draft>, editing
           ingredients: [],
           steps: [],
           tags: [],
+          course: null,
+          protein: null,
+          pageNeedsRotation: "none",
           sourceUrl: null,
           sourceName: file.name,
           sourcePhotoKey: null,
@@ -1440,6 +1832,9 @@ function AddRecipe({ onReview }: { onReview: (draft: NonNullable<Draft>, editing
     ingredients: [],
     steps: [],
     tags: [],
+    course: null,
+    protein: null,
+    pageNeedsRotation: "none",
     sourceUrl: null,
     sourceName: null,
     sourcePhotoKey: null,
@@ -1493,7 +1888,8 @@ function AddRecipe({ onReview }: { onReview: (draft: NonNullable<Draft>, editing
         <h2 className="font-display text-lg font-bold">📷 Scan a page</h2>
         <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
           Photograph a cookbook page, a magazine clipping, or a handwritten recipe card. The app
-          types it up for you to check — and keeps your photo attached as the original.
+          types it up for you to check — and keeps your photo attached as the original. If the
+          photo comes in upside down or sideways, it is turned right-side up for you automatically.
         </p>
         <button
           type="button"
@@ -1608,6 +2004,8 @@ function ReviewForm({
   const [ingredientsText, setIngredientsText] = useState(draft.ingredients.join("\n"));
   const [stepsText, setStepsText] = useState(draft.steps.join("\n"));
   const [tagsText, setTagsText] = useState(draft.tags.join(", "));
+  const [course, setCourse] = useState<string | null>(draft.course);
+  const [protein, setProtein] = useState<string | null>(draft.protein);
   const [notes, setNotes] = useState("");
   const [collectionId, setCollectionId] = useState<number | null>(
     editingId != null ? (recipes.find((r) => r.id === editingId)?.collectionId ?? null) : null,
@@ -1651,6 +2049,8 @@ function ReviewForm({
         ingredients: ingredientsText.split("\n").map((s) => s.trim()).filter(Boolean),
         steps: stepsText.split("\n").map((s) => s.trim()).filter(Boolean),
         tags: tagsText.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean),
+        course,
+        protein,
         sourceUrl: draft.sourceUrl,
         sourceName: draft.sourceName,
         collectionId,
@@ -1748,6 +2148,25 @@ function ReviewForm({
           <textarea id="f-steps" value={stepsText} onChange={(e) => setStepsText(e.target.value)} rows={8} placeholder={"Mix the flour and salt.\nKnead for 5 minutes."} className={`mt-1 ${inputCls}`} style={inputStyle} />
         </div>
         <div>
+          <span className="text-sm font-semibold" id="f-course-label">Course <span style={{ color: "var(--dim)" }}>(picked for you — tap to fix)</span></span>
+          <div className="mt-1 flex flex-wrap gap-1.5" role="group" aria-labelledby="f-course-label">
+            {COURSES.map((c) => (
+              <Chip key={c} active={course === c} onClick={() => setCourse(c)}>{c}</Chip>
+            ))}
+          </div>
+        </div>
+        <div>
+          <span className="text-sm font-semibold" id="f-protein-label">Protein / type <span style={{ color: "var(--dim)" }}>(picked for you — tap to fix)</span></span>
+          <div className="mt-1 flex flex-wrap gap-1.5" role="group" aria-labelledby="f-protein-label">
+            {PROTEINS.map((p) => (
+              <Chip key={p} active={protein === p} onClick={() => setProtein(p)}>{p}</Chip>
+            ))}
+          </div>
+          <p className="mt-1 text-xs" style={{ color: "var(--dim)" }}>
+            Time is filed automatically from the prep + cook minutes above — under 30 minutes, 30–60, or over an hour.
+          </p>
+        </div>
+        <div>
           <label htmlFor="f-tags" className="text-sm font-semibold">Tags <span style={{ color: "var(--dim)" }}>(separated by commas)</span></label>
           <input id="f-tags" type="text" value={tagsText} onChange={(e) => setTagsText(e.target.value)} placeholder="weeknight, chicken, freezer-friendly" className={`mt-1 ${inputCls}`} style={inputStyle} />
         </div>
@@ -1833,6 +2252,175 @@ function ReviewForm({
       >
         {saveMut.isPending ? "Saving…" : editingId != null ? "Save changes" : "Save this recipe"}
       </button>
+    </div>
+  );
+}
+
+// ---------- settings ----------
+
+function fmtDateTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString(undefined, { month: "long", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" });
+}
+
+function SettingsView({
+  updateInfo, checking, onRecheck,
+}: {
+  updateInfo: UpdateInfo | null;
+  checking: boolean;
+  onRecheck: () => void;
+}) {
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+  const currentNotes = notesFor(APP_VERSION);
+  const latest = updateInfo?.latestVersion ?? null;
+  const updateText = latest
+    ? `Please update my Kitchen Companion app to the latest version, v${latest}. Get it from the public GitHub repo: https://github.com/aruikis/Kitchen-Companion — use the version tagged v${latest}. Please keep all of my recipes, collections, and settings exactly as they are, install the new version the same way this app was installed before, and when it's done, tell me what's new in it.`
+    : "";
+
+  return (
+    <div>
+      <h1 className="font-display text-3xl font-bold">Settings</h1>
+
+      <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="App updates">
+        <h2 className="font-display text-xl font-bold">⬆️ App updates</h2>
+        <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
+          You’re running <strong style={{ color: "var(--text)" }}>Kitchen Companion version {APP_VERSION}</strong>.
+        </p>
+
+        {checking && !updateInfo && (
+          <p className="mt-2 text-sm" style={{ color: "var(--dim)" }} role="status">Checking for updates…</p>
+        )}
+
+        {updateInfo?.status === "up-to-date" && (
+          <div className="mt-2" role="status">
+            <p className="text-sm font-bold" style={{ color: "var(--herb)" }}>
+              ✓ You’re up to date — version {APP_VERSION} is the latest.
+            </p>
+            <p className="mt-0.5 text-sm" style={{ color: "var(--dim)" }}>
+              Version {APP_VERSION} went live {updateInfo.currentDate ? fmtDateTime(updateInfo.currentDate) : currentNotes ? prettyDate(currentNotes.date) : ""}.
+            </p>
+          </div>
+        )}
+
+        {updateInfo?.status === "unknown" && (
+          <p className="mt-2 text-sm" role="status" style={{ color: "var(--dim)" }}>
+            We couldn’t check for updates just now — the check needs the internet. Nothing is wrong with your app; try again in a bit.
+          </p>
+        )}
+
+        {updateInfo?.status === "update-available" && latest && (
+          <div className="mt-2" role="status">
+            <p className="text-sm font-bold" style={{ color: "var(--herb)" }}>
+              ⬆️ Update available — version {latest}
+              {updateInfo.latestDate ? <span className="font-normal" style={{ color: "var(--dim)" }}> · went live {fmtDateTime(updateInfo.latestDate)}</span> : null}
+            </p>
+
+            <h3 className="mt-3 text-sm font-bold">What’s new in {latest}</h3>
+            {updateInfo.whatsNew.length > 0 ? (
+              <ul className="mt-1 list-disc space-y-1 pl-5 text-sm" style={{ color: "var(--dim)" }}>
+                {updateInfo.whatsNew.map((n) => <li key={n}>{n}</li>)}
+              </ul>
+            ) : (
+              <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
+                The notes for this version are on the GitHub page — the link is below.
+              </p>
+            )}
+
+            <h3 className="mt-4 text-sm font-bold">How updating works</h3>
+            <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
+              Nothing updates on its own — ever. This copy of Kitchen Companion lives in your own
+              Muse account, so when you’re ready, your own Muse pulls the new version in for you.
+              All it takes:
+            </p>
+            <ol className="mt-1 list-decimal space-y-1 pl-5 text-sm" style={{ color: "var(--dim)" }}>
+              <li>Tap <strong style={{ color: "var(--text)" }}>Copy the update note</strong> below.</li>
+              <li>Go to your chat with Muse (outside this app) and paste it in.</li>
+              <li>Muse does the rest and tells you when it’s done. Your recipes stay exactly as they are.</li>
+            </ol>
+            <div className="mt-3 rounded-lg px-3 py-2 text-sm" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
+              {updateText}
+            </div>
+            <div className="mt-2 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={async () => setCopyState((await copyText(updateText)) ? "copied" : "failed")}
+                className="rounded-full px-4 py-2 text-sm font-bold"
+                style={{ background: "var(--herb)", color: "#10240c" }}
+              >
+                {copyState === "copied" ? "✓ Note copied" : "📋 Copy the update note"}
+              </button>
+              <a
+                href={updateInfo.repoUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="rounded-full px-4 py-2 text-sm font-semibold"
+                style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}
+              >
+                Open the GitHub page ↗
+              </a>
+            </div>
+            {copyState === "copied" && (
+              <p className="mt-2 text-sm" style={{ color: "var(--herb)" }} role="status">
+                Copied — now paste it into your chat with Muse.
+              </p>
+            )}
+            {copyState === "failed" && (
+              <div className="mt-2" role="status">
+                <p className="text-sm font-medium" style={{ color: "var(--accent)" }}>
+                  Copying isn’t available in this browser — here’s the note to copy by hand:
+                </p>
+                <label htmlFor="update-note-text" className="sr-only">The update note as text</label>
+                <textarea
+                  id="update-note-text"
+                  readOnly
+                  value={updateText}
+                  rows={5}
+                  onFocus={(e) => e.target.select()}
+                  className="mt-1 w-full rounded-lg px-3 py-2 text-sm outline-none"
+                  style={{ background: "var(--surface2)", border: "1px solid var(--border)", color: "var(--text)" }}
+                />
+              </div>
+            )}
+          </div>
+        )}
+
+        <button
+          type="button"
+          onClick={onRecheck}
+          disabled={checking}
+          className="mt-3 rounded-full px-4 py-2 text-sm font-semibold disabled:opacity-50"
+          style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}
+        >
+          {checking ? "Checking…" : "Check again"}
+        </button>
+        {updateInfo && (
+          <p className="mt-1 text-xs" style={{ color: "var(--dim)" }}>
+            Last checked {fmtDateTime(updateInfo.checkedAt)} · new versions are published at github.com/aruikis/Kitchen-Companion
+          </p>
+        )}
+      </section>
+
+      <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="About and version history">
+        <h2 className="font-display text-xl font-bold">About</h2>
+        <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
+          Kitchen Companion UAT · Version {APP_VERSION}. Your recipes live in this app, in your own
+          Muse account — and you can download a full backup any time from the bottom of the Recipes tab.
+        </p>
+        <h3 className="mt-3 text-sm font-bold">Version history</h3>
+        <div className="mt-1 space-y-2">
+          {CHANGELOG.map((v) => (
+            <details key={v.version} className="rounded-lg px-3 py-2" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
+              <summary className="cursor-pointer text-sm font-semibold">
+                Version {v.version} · {prettyDate(v.date)}{v.version === APP_VERSION ? " (this one)" : ""}
+              </summary>
+              <ul className="mt-1 list-disc space-y-1 pl-5 text-sm" style={{ color: "var(--dim)" }}>
+                {v.notes.map((n) => <li key={n}>{n}</li>)}
+              </ul>
+            </details>
+          ))}
+        </div>
+      </section>
     </div>
   );
 }
@@ -2188,46 +2776,17 @@ function JewelShop({ uncheckedCount }: { uncheckedCount: number }) {
       {shownCart && (
         <div className="mt-3 rounded-[var(--radius)] px-4 py-3" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
           <p className="text-sm font-semibold">
-            {shownCart.storeName} cart · {shownCart.itemCount} item{shownCart.itemCount === 1 ? "" : "s"} · built {new Date(shownCart.createdAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+            {shownCart.storeName} list · {shownCart.itemCount} item{shownCart.itemCount === 1 ? "" : "s"} · built {new Date(shownCart.createdAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
           </p>
-          <ul className="mt-2 max-h-56 space-y-1 overflow-y-auto text-sm">
-            {shownCart.items.map((i, idx) => (
-              <li key={idx}>{i.detail && <span className="font-semibold">{i.detail} </span>}{i.name}</li>
-            ))}
-          </ul>
-          <div className="mt-3 flex flex-wrap gap-2">
-            <a
-              href={shopQ.data?.jewelUrl ?? JEWEL_URL}
-              target="_blank"
-              rel="noreferrer"
-              className="rounded-full px-4 py-2 text-sm font-bold"
-              style={{ background: "var(--accent)", color: "var(--accent-ink)" }}
-            >
-              Open Jewel-Osco & check out ↗
-            </a>
-            <button
-              type="button"
-              onClick={async () => {
-                const ok = await copyText(shownCart.cartText);
-                setNotice(ok ? "Cart copied — paste it into Jewel-Osco, or keep it as your in-store list." : "Copying is not available here right now.");
-              }}
-              className="rounded-full px-4 py-2 text-sm font-semibold"
-              style={{ background: "var(--surface)", border: "1px solid var(--border)" }}
-            >
-              Copy the cart
-            </button>
-            <button
-              type="button"
-              disabled={sentMut.isPending}
-              onClick={() => sentMut.mutate({ id: shownCart.id })}
-              className="rounded-full px-4 py-2 text-sm font-semibold disabled:opacity-50"
-              style={{ background: "var(--surface)", border: "1px solid var(--herb)", color: "var(--herb)" }}
-            >
-              ✓ I ordered this at Jewel-Osco
-            </button>
+          <div className="mt-2">
+            <JewelHandoff
+              order={shownCart}
+              jewelUrl={shopQ.data?.jewelUrl ?? JEWEL_URL}
+              ordering={sentMut.isPending}
+              onOrdered={() => sentMut.mutate({ id: shownCart.id })}
+            />
           </div>
           <p className="mt-2 text-xs" style={{ color: "var(--dim)" }}>
-            On Jewel-Osco’s site: sign in, search each item, add it to your cart, pick pickup or delivery, and pay.
             Marking it ordered here clears these items off your shopping list.
           </p>
         </div>

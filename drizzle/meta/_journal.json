@@ -22,6 +22,13 @@
       "when": 1794085548079,
       "tag": "0003_add_jewel_shop_settings_and_orders",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1794237786293,
+      "tag": "0004_add_recipe_categories",
+      "breakpoints": true
     }
   ]
 }
