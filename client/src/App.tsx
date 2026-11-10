@@ -154,7 +154,7 @@ const JEWEL_URL = "https://www.jewelosco.com/";
 
 // Visible version (Anthony's standing rule: the UAT carries its version
 // number in the app, and the GitHub push of this build is tagged with it).
-const APP_VERSION = "1.7.0";
+const APP_VERSION = "1.7.1";
 
 // Automatic categories (chosen by the app when a recipe is added; the cook
 // can correct them). Mirrors the server's lists in actions.ts.
@@ -885,6 +885,7 @@ export function App() {
                   tags: r.tags,
                   course: r.course,
                   protein: r.protein,
+                  readWarning: null,
                   pageNeedsRotation: "none",
                   sourceUrl: r.sourceUrl,
                   sourceName: r.sourceName,
@@ -4061,6 +4062,11 @@ function ImportInbox({ onReviewStaged }: { onReviewStaged: (item: StagedItem) =>
                     ⚠️ Looks like “{item.similarTitle}”, which is already in your library — you may be able to skip this one.
                   </p>
                 )}
+                {item.draft?.readWarning && (
+                  <p className="mt-1 text-sm font-medium" style={{ color: "#e8a33d" }} role="status">
+                    ⚠️ Part of this one couldn't be read clearly — open it to see what came through, with the original kept beside it.
+                  </p>
+                )}
                 <div className="mt-2 flex flex-wrap gap-2">
                   <button
                     type="button"
@@ -4204,6 +4210,7 @@ function AddRecipe({ onReview, onReviewStaged }: { onReview: (draft: NonNullable
           tags: [],
           course: null,
           protein: null,
+          readWarning: null,
           pageNeedsRotation: "none",
           sourceUrl: null,
           sourceName: file.name,
@@ -4233,6 +4240,7 @@ function AddRecipe({ onReview, onReviewStaged }: { onReview: (draft: NonNullable
     tags: [],
     course: null,
     protein: null,
+    readWarning: null,
     pageNeedsRotation: "none",
     sourceUrl: null,
     sourceName: null,
@@ -4527,6 +4535,11 @@ function ReviewForm({
           : "Here’s what was read in. Fix anything that looks wrong, then save — nothing is kept until you do."}
       </p>
 
+      {draft.readWarning && editingId == null && (
+        <p className="mt-3 rounded-[var(--radius)] px-4 py-3 text-sm font-medium" style={{ background: "var(--surface)", border: "1px solid #e8a33d", color: "var(--text)" }} role="alert">
+          ⚠️ {draft.readWarning}
+        </p>
+      )}
       {sourceNote && (
         <p className="mt-3 rounded-[var(--radius)] px-4 py-3 text-sm" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} role="status">
           {sourceNote}

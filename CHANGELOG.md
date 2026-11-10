@@ -3,6 +3,12 @@
 Every version, newest first. These are the same notes the app shows in
 Settings → App updates — one list, plain and simple.
 
+## v1.7.1 — 2026-11-10
+- Fixed: a recipe photo that's too faint or blurry to read no longer turns into scrambled nonsense words.
+- If a page can't be read clearly, the app says so up front and keeps your photo with the recipe, so you can type from it or take the photo again in better light.
+- Fixed: a note in an email — “here's the recipe, love Mom” — no longer ends up as steps in the recipe.
+- Only words that read clearly are kept now; anything scrambled is left out, never saved.
+
 ## v1.7.0 — 2026-11-09
 - Moving between screens now glides instead of jumping — tabs, recipe pages, and pop-up panels ease in with a soft, springy feel.
 - The tab you pick at the bottom gives a little bounce, so you can see where you landed.

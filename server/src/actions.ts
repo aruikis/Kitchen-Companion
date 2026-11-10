@@ -438,8 +438,15 @@ const inferenceDraftSchema = z.object({
 // The scanner also reports how the photographed page sits in the photo, so
 // a page photographed upside down or sideways can be turned right-side up
 // automatically (the client rotates the stored photo by this many degrees).
+// It also reports whether the page was CLEARLY readable (v1.7.1): a page
+// photographed in poor light, or a faint scan attached to an email, must be
+// flagged as unreadable — never transcribed as a guess. This field, plus
+// the deterministic readability gate below, is what stops the garbled
+// "ingredients" Liz was sent (Nov 10, 2026) from ever reaching a review
+// screen again.
 const scanDraftSchema = inferenceDraftSchema.extend({
   pageNeedsRotation: z.enum(["none", "90", "180", "270"]),
+  clearlyReadable: z.boolean(),
 });
 
 type InferenceDraft = z.infer<typeof inferenceDraftSchema>;
@@ -456,6 +463,152 @@ function cleanDraft(d: InferenceDraft) {
     tags: d.tags.map((s) => s.trim().toLowerCase()).filter(Boolean).slice(0, 8),
     course: asCourse(d.course),
     protein: asProtein(d.protein),
+    readWarning: null as string | null,
+  };
+}
+
+// ---------- readability gate (v1.7.1) ----------
+// The failure this stops (Liz's "Mini Cajun Chicken Pot Pies", Nov 10,
+// 2026): a recipe that lived only in a faint photo attached to an email
+// came back from the read as one good line ("4 tbsp. salted butter")
+// followed by character-salad — "La =. °»§ sie Saar ee >: : nes",
+// "ea Oo ee ee ee eo ak eo" — and the email's covering note ("Here is the
+// recipe we talked about. Love, Mom") plus an "Attachment text — …jpg"
+// label were saved as the recipe's steps. The model had been told to make
+// its "best reading" of unclear writing, and nothing anywhere checked
+// whether what came back was readable English at all.
+//
+// The gate is deterministic and conservative — it runs on EVERY read path
+// (photo scan, pasted/emailed text, web-page fallback) after the model:
+//  - a line that scores as garbled (hard symbols real recipes never use,
+//    no recognisable word, mostly implausible letter-fragments, one token
+//    repeated over and over, a vowel ratio no English line has) is DROPPED,
+//    never saved and never shown as a recipe line;
+//  - a line that is plainly an email covering note or an attachment label
+//    is dropped the same way — it is not part of any recipe;
+//  - whatever survives is counted. If nothing readable survives, or the
+//    dropped lines outnumber the kept ones, the draft is flagged with a
+//    plain `readWarning` the review screen shows at the top, and (for a
+//    photo) the original is kept so the cook can type from it or retake
+//    the photo in better light. Real recipe lines — units, fractions,
+//    "350°F", foreign dish names like gochujang or crème fraîche — pass:
+//    a word also counts as plausible when it is shaped like a word
+//    (consonants and vowels together), so only true fragments score.
+
+const KNOWN_WORDS = new Set(
+  (
+    "the a an and or of to in on at for with without over under into onto from by as is are was were be been it its this that these those you your we our they their then than so if but when while until before after about above below between through during each one two three four five six seven eight nine ten half halves quarter quarters third thirds " +
+    "tbsp tablespoon tablespoons tsp teaspoon teaspoons cup cups oz ounce ounces lb lbs pound pounds gram grams kg ml liter liters litre quart quarts pint pints gallon dash dashes pinch pinches can cans clove cloves bunch bunches package packages pkg box boxes bag bags head heads stalk stalks slice slices piece pieces scoop scoops sprig sprigs sheet sheets bulb bulbs drop drops whole " +
+    "add mix stir combine whisk beat fold sift knead pour place put set bring heat preheat bake broil fry saute simmer boil roast grill toast melt chop diced minced sliced peel peeled grated shredded drain drained rinse rinsed soak marinate season sprinkle garnish serve remove transfer cover uncover reduce bring cook cooked cooking fry frying line grease flour dust roll flatten spread brush flip turn toss coat stuff wrap chill refrigerate freeze thaw rest cool warm reheat taste adjust squeeze drizzle scoop spoon arrange layer top fill frost cut trim core seed pound score pat dry let stand make sure use using used divided optional taste room temperature fresh freshly finely roughly thinly thickly lightly well hot cold lukewarm soft firm tender crisp crispy golden brown large medium small " +
+    "salt pepper sugar flour butter oil olive vegetable canola egg eggs milk cream cheese cheddar mozzarella parmesan swiss provolone feta ricotta mascarpone yogurt sour buttermilk water broth stock chicken beef wine vinegar lemon lime orange juice zest garlic onion onions shallot shallots scallion scallions chive chives parsley cilantro basil thyme rosemary oregano sage dill mint bay leaf leaves paprika smoked cumin chili powder cayenne cinnamon nutmeg ginger turmeric curry coriander vanilla extract almond baking soda tomato tomatoes potato potatoes sweet yam yams carrot carrots celery bell peppers jalapeno mushroom mushrooms spinach kale lettuce cabbage broccoli cauliflower beans black kidney pinto chickpeas lentils peas corn rice quinoa pasta noodles spaghetti penne macaroni lasagna bread crumbs panko tortillas dough crust pie pastry puff honey maple syrup molasses cocoa chocolate chips peanut almonds walnuts pecans cashews coconut raisins dried apple apples pear pears peach peaches banana bananas avocado cucumber cucumbers zucchini squash pumpkin okra asparagus artichoke leeks fennel radishes beets turnips parsnips sauerkraut kimchi pickles olives capers mustard dijon mayonnaise ketchup sauce soy hot miso tahini salsa " +
+    "turkey duck pork bacon ham sausage kielbasa salami pepperoni prosciutto chorizo ground steak brisket chuck ribs rib loin sirloin tenderloin breast breasts thigh thighs wing wings drumsticks shrimp prawns salmon tuna cod tilapia halibut crab scallops clams mussels oysters lobster trout catfish fish seafood meat meatballs tofu tempeh " +
+    "minute minutes hour hours second seconds day days overnight inch inches degrees fahrenheit celsius pan pot skillet dutch oven baking sheet dish casserole slow cooker instant oven stove stovetop burner flame rolling gentle high low preheated lined parchment foil plastic wrap lid covered uncovered tray rack wire bowl bowls plate plates platter serving spatula tongs knife board cutting paper towel towels side top bottom middle center centre edge edges surface first second third next last final remaining reserve reserved aside more most other another same per every"
+  ).split(/\s+/),
+);
+
+function wordShapePlausible(w: string): boolean {
+  if (w.length < 3) return false;
+  if (/(.)\1\1/.test(w)) return false; // a letter three times in a row
+  const hasVowel = /[aeiouyàâäéèêëîïôöùûüæøå]/.test(w);
+  const hasConsonant = /[bcdfghjklmnpqrstvwxzçñß]/.test(w);
+  return hasVowel && hasConsonant;
+}
+
+function lineLooksGarbled(line: string): boolean {
+  const raw = line.trim();
+  if (!raw) return false;
+  let score = 0;
+  // Symbols that essentially never appear in a recipe line.
+  if (/[§»«[\]{}<>|=\\^~*•·]/.test(raw)) score += 2;
+  // A degree sign that is not part of °F / °C.
+  if (/°(?![fc]\b)/i.test(raw)) score += 1;
+  // A closing bracket with no opening one.
+  if (raw.includes(")") && !raw.includes("(")) score += 1;
+
+  const words = (raw.toLowerCase().match(/[\p{L}']+/gu) ?? []).filter((w) => w.length > 0);
+  const letters = raw.replace(/[^\p{L}]/gu, "");
+  if (words.length >= 2) {
+    const longWords = words.filter((w) => w.length > 1);
+    const known = longWords.filter((w) => KNOWN_WORDS.has(w)).length;
+    if (known === 0) score += 1;
+    const denom = longWords.length || 1;
+    const implausible = longWords.filter((w) => !KNOWN_WORDS.has(w) && !wordShapePlausible(w)).length;
+    if (implausible / denom > 0.4) score += 2;
+    if (words.length >= 4) {
+      const counts = new Map<string, number>();
+      for (const w of words) counts.set(w, (counts.get(w) ?? 0) + 1);
+      let maxRepeat = 0;
+      for (const v of counts.values()) maxRepeat = Math.max(maxRepeat, v);
+      if (maxRepeat / words.length >= 0.4) score += 1;
+    }
+    if (letters.length >= 8) {
+      const vowels = (letters.toLowerCase().match(/[aeiouyàâäéèêëîïôöùûü]/g) ?? []).length;
+      const ratio = vowels / letters.length;
+      if (ratio > 0.68 || ratio < 0.12) score += 1;
+    }
+  } else if (words.length === 1) {
+    const w = words[0] ?? "";
+    if (w.length > 1 && !KNOWN_WORDS.has(w) && !wordShapePlausible(w)) score += 2;
+  }
+  return score >= 3;
+}
+
+// Lines that are an email's covering note or an attachment label — part of
+// the envelope, never part of the recipe. (The pot-pie import saved
+// "Here is the recipe we talked about." / "Love," / "Mom" and an
+// "Attachment text — 0_Mini_Cajun_Pot_Pies.jpg" label as steps 1–4.)
+function isEmailCoverLine(line: string): boolean {
+  const t = line.trim();
+  if (!t) return false;
+  if (/attachment\s+text/i.test(t)) return true;
+  // A bare attached-file name standing as its own line.
+  if (/^[\w .()\-]+\.(jpe?g|png|gif|heic|webp|pdf|docx?|txt)$/i.test(t)) return true;
+  // "Here is the recipe we talked about", "Here's the one you asked for"…
+  if (/^(here(?:'s| is| are)\b|i (?:found|thought you|hope you)|thought you)/i.test(t) && /\b(recipe|talked|asked|wanted|promised)\b/i.test(t)) return true;
+  // A sign-off standing alone: "Love," / "Thanks!" / "Enjoy"
+  if (/^(love|with love|lots of love|thanks|thank you|many thanks|enjoy|xoxo|best|take care|from|yours)[,!.\s]*$/i.test(t)) return true;
+  // A lone sign-off name: "Mom".
+  if (/^(mom|mum|mother|dad|grandma|grandpa|nana|papa)[,.!]*$/i.test(t)) return true;
+  // A short greeting line: "Hi Liz," / "Dear Liz!"
+  if (/^(hi|hello|hey|dear)\b[^.]*[,!]$/i.test(t) && t.length < 60) return true;
+  return false;
+}
+
+function sanitizeReadLines(lines: string[]): { kept: string[]; dropped: number } {
+  const kept: string[] = [];
+  let dropped = 0;
+  for (const line of lines) {
+    if (isEmailCoverLine(line) || lineLooksGarbled(line)) dropped++;
+    else kept.push(line);
+  }
+  return { kept, dropped };
+}
+
+const READ_WARNING_POOR =
+  "Part of this couldn't be read clearly, so the scrambled lines were left out instead of being saved as nonsense. What's below is only what read clearly — check it against the original (kept with this recipe) and type in anything that's missing, or try again in better light.";
+const READ_WARNING_SOME =
+  "A few lines couldn't be read clearly and were left out rather than guessed at. Check what's below against the original (kept with this recipe) and add anything that's missing.";
+
+// Runs the gate over a cleaned draft's ingredients and steps and reports
+// how the read went: "good" (nothing dropped), "some" (a minority dropped),
+// or "poor" (nothing readable survived, or dropped lines outnumber kept).
+function gateReadDraft<T extends { ingredients: string[]; steps: string[] }>(
+  draft: T,
+): { draft: T & { readWarning: string | null }; quality: "good" | "some" | "poor" } {
+  const ing = sanitizeReadLines(draft.ingredients);
+  const stp = sanitizeReadLines(draft.steps);
+  const kept = ing.kept.length + stp.kept.length;
+  const dropped = ing.dropped + stp.dropped;
+  const quality: "good" | "some" | "poor" =
+    dropped === 0 ? "good" : kept === 0 || dropped > kept ? "poor" : "some";
+  return {
+    draft: {
+      ...draft,
+      ingredients: ing.kept,
+      steps: stp.kept,
+      readWarning: quality === "good" ? null : quality === "poor" ? READ_WARNING_POOR : READ_WARNING_SOME,
+    },
+    quality,
   };
 }
 
@@ -947,6 +1100,7 @@ async function draftFromUrl(ctx: Ctx, url: string): Promise<DraftResponse> {
         tags: rawTags.map((t) => t.trim().toLowerCase()).filter(Boolean).slice(0, 8),
         course: cats.course,
         protein: cats.protein,
+        readWarning: null,
         pageNeedsRotation: "none",
         sourceUrl,
         sourceName: host || null,
@@ -965,10 +1119,11 @@ async function draftFromUrl(ctx: Ctx, url: string): Promise<DraftResponse> {
   }
   try {
     const structured = await ctx.inference.complete(
-      "Read this web page text and extract the recipe it contains. Ignore navigation, ads, comments, and the author's personal story — keep only the recipe itself.",
+      "Read this web page text and extract the recipe it contains. Ignore navigation, ads, comments, and the author's personal story — keep only the recipe itself. Copy only text that is clearly readable; never invent or guess at garbled characters — leave unreadable fragments out entirely.",
       { schema: inferenceDraftSchema, system: "You extract recipes from noisy web pages into clean structured data. Page text:\n\n" + text },
     );
-    const cleaned = cleanDraft(structured);
+    const gated = gateReadDraft(cleanDraft(structured));
+    const cleaned = gated.draft;
     if (cleaned.ingredients.length === 0 && cleaned.steps.length === 0) {
       return emptyDraftError("No recipe could be found on that page. Try pasting the recipe text instead.");
     }
@@ -997,17 +1152,53 @@ async function draftFromUrl(ctx: Ctx, url: string): Promise<DraftResponse> {
 // structureText action (paste / text-file upload) and by email staging,
 // so an email's recipe goes through exactly the same pipeline.
 async function draftFromText(ctx: Ctx, text: string): Promise<DraftResponse> {
+  // Pre-clean (v1.7.1): email text arrives with an envelope around the
+  // recipe — a covering note, an "Attachment text — …" label, and, when
+  // the recipe itself lived in an attached photo, the mail reader's own
+  // scrambled attempt at that photo. None of that may reach the model as
+  // recipe text: the note became "steps" and the scramble became
+  // "ingredients" in Liz's pot-pie import. Clearly-readable recipe lines
+  // pass through untouched; the rest is set aside (and counted, so a text
+  // that was mostly envelope/scramble reads as unreadable, not as a
+  // recipe made of the few surviving fragments).
+  const rawLines = text.split(/\r?\n/);
+  const usable: string[] = [];
+  let setAside = 0;
+  for (const line of rawLines) {
+    const t = line.trim();
+    if (!t) continue;
+    if (isEmailCoverLine(t) || lineLooksGarbled(t)) setAside++;
+    else usable.push(line);
+  }
+  const usableText = usable.join("\n").trim();
+  if (usableText.length < 10) {
+    return emptyDraftError(
+      setAside > 0
+        ? "No readable recipe words were found in that text — what was there couldn't be read clearly. If the recipe is in a photo, try the scanner so the page itself can be read."
+        : "That text could not be turned into a recipe automatically. You can still type the recipe in by hand.",
+    );
+  }
   try {
     const structured = await ctx.inference.complete(
-      "Turn this text into a clean structured recipe. Keep the cook's own quantities and wording; split ingredients and steps into separate entries.",
-      { schema: inferenceDraftSchema, system: "Recipe text:\n\n" + text.slice(0, 20000) },
+      "Turn this text into a clean structured recipe. Keep the cook's own quantities and wording; split ingredients and steps into separate entries. The text may still carry scraps of an email around the recipe — a greeting, a covering note ('here is the recipe we talked about'), a sign-off ('Love, Mom'), an attachment label: those are NOT part of the recipe and must never appear in the ingredients or steps. Copy only words that are clearly readable; never invent, repair, or guess at garbled characters — leave unreadable fragments out entirely.",
+      { schema: inferenceDraftSchema, system: "Recipe text:\n\n" + usableText.slice(0, 20000) },
     );
-    const cleaned = cleanDraft(structured);
+    const gated = gateReadDraft(cleanDraft(structured));
+    const cleaned = gated.draft;
+    if (cleaned.ingredients.length === 0 && cleaned.steps.length === 0) {
+      return emptyDraftError("No readable recipe could be found in that text. If the recipe is in a photo, try the scanner so the page itself can be read.");
+    }
+    // If the envelope/scramble set aside before the read outweighed the
+    // recipe words that survived it, say so on the review screen.
+    const finalDraft =
+      gated.quality === "good" && setAside >= 3 && setAside > usable.length
+        ? { ...cleaned, readWarning: READ_WARNING_POOR }
+        : cleaned;
     return {
       ok: true,
       error: null,
       draft: {
-        ...cleaned,
+        ...finalDraft,
         pageNeedsRotation: "none",
         sourceUrl: null,
         sourceName: null,
@@ -1036,16 +1227,27 @@ async function draftFromImage(
   await ctx.blobs.put(key, bytes, { contentType: mimeType });
   try {
     const structured = await ctx.inference.complete(
-      "Read the recipe in this photo and return it structured. Transcribe quantities and steps exactly as written; if handwriting is unclear, make your best reading — the cook will check and fix it on the next screen. Also judge how the page sits in the photo and report pageNeedsRotation: the clockwise rotation, in degrees, that would make the page right-side up ('none' if it already is).",
+      "Read the recipe in this photo and return it structured. Transcribe quantities and steps exactly as written — but ONLY what you can read clearly. Never guess at blurred, faint, shadowed, or cut-off words, and never invent text to fill a gap: if a word or a whole line cannot be read clearly, leave it out. Set clearlyReadable to true only if essentially the whole page read clearly; if much of the page was too faint or unclear to read with confidence, set it to false and return only the parts that did read clearly (empty lists if nothing did). Also judge how the page sits in the photo and report pageNeedsRotation: the clockwise rotation, in degrees, that would make the page right-side up ('none' if it already is).",
       {
         schema: scanDraftSchema,
         images: [{ dataBase64, mimeType, caption: "Photo of a recipe page or card" }],
       },
     );
-    const cleaned = cleanDraft(structured);
+    // The readability gate has the final say (v1.7.1): even a confident
+    // read is checked line by line, and a read the model itself flags as
+    // unclear — or one where the scrambled lines outnumber the clear
+    // ones — is presented as a poor read, never as a finished recipe.
+    const gated = gateReadDraft(cleanDraft(structured));
+    const poor = gated.quality === "poor" || !structured.clearlyReadable;
+    const cleaned = {
+      ...gated.draft,
+      readWarning: poor ? READ_WARNING_POOR : gated.draft.readWarning,
+    };
     return {
-      ok: true,
-      error: null,
+      ok: !poor,
+      error: poor
+        ? "That photo couldn't be read clearly enough. It has been kept with the recipe — you can type from it on the review screen, or take the photo again in better light."
+        : null,
       draft: {
         ...cleaned,
         pageNeedsRotation: structured.pageNeedsRotation,
@@ -1063,6 +1265,7 @@ async function draftFromImage(
       error: "The photo could not be read automatically. It has been kept — you can type the recipe in by hand on the review screen.",
       draft: {
         ...blankDraft(),
+        readWarning: READ_WARNING_POOR,
         sourceName: "Scanned page",
         scanPhotoKey: key,
       },
@@ -1623,6 +1826,11 @@ const draftObject = z.object({
   tags: z.array(z.string()),
   course: z.string().nullable(),
   protein: z.string().nullable(),
+  // Plain-language warning set when part of a read couldn't be read
+  // clearly (v1.7.1): the review screen shows it at the top so a partial
+  // read is never mistaken for the whole recipe. `.default(null)` keeps
+  // drafts staged before this field existed parseable.
+  readWarning: z.string().nullable().default(null),
   pageNeedsRotation: z.enum(["none", "90", "180", "270"]),
   sourceUrl: z.string().nullable(),
   sourceName: z.string().nullable(),
@@ -1656,6 +1864,7 @@ function blankDraft(): DraftObject {
     tags: [],
     course: null,
     protein: null,
+    readWarning: null,
     pageNeedsRotation: "none",
     sourceUrl: null,
     sourceName: null,
@@ -2055,7 +2264,7 @@ export const Actions = {
   }),
 
   scanImage: defineAction({
-    description: "Reads a photo of a recipe page or card with vision OCR and returns a structured draft for review; the photo itself is stored as the recipe's original.",
+    description: "Reads a photo of a recipe page or card with vision OCR and returns a structured draft for review; the photo itself is stored as the recipe's original. Only clearly-readable text is transcribed — a page that cannot be read clearly comes back flagged with a readWarning (never as guessed or garbled text), with the photo kept so the cook can type from it or retake it.",
     request: z.object({
       dataBase64: z.string().min(1),
       mimeType: z.enum(["image/jpeg", "image/png"]),
@@ -3344,7 +3553,7 @@ export const Actions = {
   }),
 
   stageEmailImport: defineAction({
-    description: "Stages a recipe found in the user's email into Kitchen Companion's import inbox for the cook's review — called by the user's own Muse after searching their connected mailbox (the app itself never reads email). Accepts the recipe's words (the email body or a transcription), and/or ONE attached file as base64 (a photo of a recipe card, a text file, or a PDF), plus where it came from: sender name, sender email, email subject, and the email's date. The recipe runs through the app's normal import pipeline (text structuring / photo OCR, automatic categories) and waits in the import inbox — nothing is saved into the recipe library until the cook checks, edits, and approves it on the review screen. If a recipe with the same or a very similar title is already in the library, the response and the review screen flag it so the cook can skip it.",
+    description: "Stages a recipe found in the user's email into Kitchen Companion's import inbox for the cook's review — called by the user's own Muse after searching their connected mailbox (the app itself never reads email). Accepts the recipe's words (the email body or a transcription), and/or ONE attached file as base64 (a photo of a recipe card, a text file, or a PDF), plus where it came from: sender name, sender email, email subject, and the email's date. The recipe runs through the app's normal import pipeline (text structuring / photo OCR, automatic categories) and waits in the import inbox — nothing is saved into the recipe library until the cook checks, edits, and approves it on the review screen. If a recipe with the same or a very similar title is already in the library, the response and the review screen flag it so the cook can skip it. Readability rule (v1.7.1): only clearly-readable text is ever staged — garbled lines and the email's covering note are dropped, an attachment photo that cannot be read clearly is staged flagged with a readWarning and its original photo kept, and the email body is never turned into recipe steps when the recipe lives in an attachment. IMPORTANT for the calling Muse: pass the attachment itself as base64 whenever the recipe is in an attached photo or file — do NOT pass your own extraction of an attachment as `text`; attachment extractions are exactly what produced garbled recipes before this fix.",
     request: z.object({
       senderName: z.string().default(""),
       senderEmail: z.string().default(""),
@@ -3383,7 +3592,7 @@ export const Actions = {
         const res = await draftFromImage(ctx, att.dataBase64, att.mimeType);
         draft = res.draft;
         if (!res.ok) {
-          readNote = "The attached photo could not be read automatically — it is kept with the recipe so the cook can type it up on the review screen.";
+          readNote = res.error ?? "The attached photo could not be read clearly — it is kept with the recipe so the cook can type it up on the review screen.";
         }
       } else if (att && (att.mimeType.startsWith("text/") || /\.(txt|md)$/i.test(att.filename))) {
         // A text file: structure its words AND keep the file itself attached.
@@ -3483,6 +3692,9 @@ export const Actions = {
         notes.push(`It looks like a recipe already in the library (“${similarTitle}”), so the review screen flags it and the cook can skip it.`);
       }
       if (readNote) notes.push(readNote);
+      if (draft.readWarning) {
+        notes.push(`Read quality: ${draft.readWarning} The review screen shows this warning at the top, and the original ${att && (att.mimeType === "image/jpeg" || att.mimeType === "image/png") ? "photo" : "email"} is kept with the recipe so the cook can check against it.`);
+      }
       return {
         ok: true as const,
         stagedId: row.id,

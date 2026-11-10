@@ -18,6 +18,16 @@ export type VersionNotes = {
 
 export const CHANGELOG: VersionNotes[] = [
   {
+    version: "1.7.1",
+    date: "2026-11-10",
+    notes: [
+      "Fixed: a recipe photo that's too faint or blurry to read no longer turns into scrambled nonsense words.",
+      "If a page can't be read clearly, the app says so up front and keeps your photo with the recipe, so you can type from it or take the photo again in better light.",
+      "Fixed: a note in an email — “here's the recipe, love Mom” — no longer ends up as steps in the recipe.",
+      "Only words that read clearly are kept now; anything scrambled is left out, never saved.",
+    ],
+  },
+  {
     version: "1.7.0",
     date: "2026-11-09",
     notes: [
