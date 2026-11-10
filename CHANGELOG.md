@@ -3,6 +3,11 @@
 Every version, newest first. These are the same notes the app shows in
 Settings → App updates — one list, plain and simple.
 
+## v1.6.1 — 2026-11-09
+- The Recipes page is just your recipes now — the backup panel and version notes moved off it.
+- Everything backup lives in Settings now: download a backup, restore one, and the extra server copy are all under Backup & safety.
+- What's new for every version is in Settings too, under App updates — that's its only home now.
+
 ## v1.6.0 — 2026-11-09
 - Friends opens faster — the list is ready before you tap, and checks for anything new behind the scenes.
 - Sharing: you can now pick exactly who gets a recipe — just one person, a few, or all your friends.

@@ -1,4 +1,4 @@
-# Kitchen Companion (UAT) — v1.6.0
+# Kitchen Companion (UAT) — v1.6.1
 
 A recipe app built as a Muse space (TypeScript). Save recipes from a link or
 Pinterest pin, scan a cookbook page, upload a file, bring them in from your
@@ -15,21 +15,14 @@ top-rated homemade lasagna. They are loaded by the app's own `seedExamples`
 action; no database is included in this repo, so a fresh install starts empty
 apart from those examples.
 
-## What's new in v1.6.0
+## What's new in v1.6.1
 
-- Friends opens faster — the list is ready before you tap, and checks for
-  anything new behind the scenes.
-- Sharing: you can now pick exactly who gets a recipe — just one person, a
-  few, or all your friends.
-- Collections can be shared with picked people too, the same way.
-- Each thing you share now says who can see it, and you can take a person
-  off its list any time.
-- Fixed: Back on your own profile page now returns to your Friends list.
-- Fixed: Back from a recipe now returns to the page you opened it from —
-  your profile, a friend's profile, or the list — and Back from the
-  check-and-fix screen returns to the recipe you were editing.
-- Fixed: “View my profile page” in Settings now opens your profile every
-  time.
+- The Recipes page is just your recipes now — the backup panel and version
+  notes moved off it.
+- Everything backup lives in Settings now: download a backup, restore one,
+  and the extra server copy are all under Backup & safety.
+- What's new for every version is in Settings too, under App updates —
+  that's its only home now.
 
 ## Installing (for your Muse)
 

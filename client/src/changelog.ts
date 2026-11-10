@@ -18,6 +18,15 @@ export type VersionNotes = {
 
 export const CHANGELOG: VersionNotes[] = [
   {
+    version: "1.6.1",
+    date: "2026-11-09",
+    notes: [
+      "The Recipes page is just your recipes now — the backup panel and version notes moved off it.",
+      "Everything backup lives in Settings now: download a backup, restore one, and the extra server copy are all under Backup & safety.",
+      "What's new for every version is in Settings too, under App updates — that's its only home now.",
+    ],
+  },
+  {
     version: "1.6.0",
     date: "2026-11-09",
     notes: [

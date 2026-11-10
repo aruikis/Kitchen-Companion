@@ -154,7 +154,7 @@ const JEWEL_URL = "https://www.jewelosco.com/";
 
 // Visible version (Anthony's standing rule: the UAT carries its version
 // number in the app, and the GitHub push of this build is tagged with it).
-const APP_VERSION = "1.6.0";
+const APP_VERSION = "1.6.1";
 
 // Automatic categories (chosen by the app when a recipe is added; the cook
 // can correct them). Mirrors the server's lists in actions.ts.
@@ -776,7 +776,6 @@ export function App() {
             loading={recipesQ.isPending}
             error={recipesQ.error ? String(recipesQ.error) : null}
             updateInfo={updateInfo}
-            profile={profile}
             stagedCount={stagedItems.length}
             onOpenSettings={() => setTab("settings")}
             onOpen={openRecipe}
@@ -808,6 +807,8 @@ export function App() {
             recoveryKey={profileQ.data?.recoveryKey ?? null}
             onShowTutorial={() => setShowTutorial(true)}
             onViewProfile={() => { setOwnProfileSignal((s) => s + 1); setTab("friends"); }}
+            recipes={recipes}
+            collections={collections}
           />
         )}
       </main>
@@ -859,14 +860,13 @@ export function App() {
 type Filter = "all" | "favorites" | "want" | "made";
 
 function Library({
-  recipes, collections, loading, error, updateInfo, profile, stagedCount, onOpenSettings, onOpen, onAdd,
+  recipes, collections, loading, error, updateInfo, stagedCount, onOpenSettings, onOpen, onAdd,
 }: {
   recipes: Recipe[];
   collections: Collection[];
   loading: boolean;
   error: string | null;
   updateInfo: UpdateInfo | null;
-  profile: MyProfile | null;
   stagedCount: number;
   onOpenSettings: () => void;
   onOpen: (id: number) => void;
@@ -1150,22 +1150,6 @@ function Library({
         })}
       </div>
 
-      <BackupBar recipes={recipes} collections={collections} profile={profile} />
-
-      <footer className="mt-8 pb-2 text-center">
-        <p className="text-xs" style={{ color: "var(--dim)" }}>Kitchen Companion UAT · Version {APP_VERSION}</p>
-        <details
-          className="mx-auto mt-2 max-w-md rounded-[var(--radius)] px-4 py-3 text-left"
-          style={{ background: "var(--surface)", border: "1px solid var(--border)" }}
-        >
-          <summary className="cursor-pointer text-sm font-semibold">What’s new in {APP_VERSION}</summary>
-          <ul className="mt-2 list-disc space-y-1 pl-5 text-sm" style={{ color: "var(--dim)" }}>
-            {(notesFor(APP_VERSION)?.notes ?? []).map((n) => (
-              <li key={n}>{n}</li>
-            ))}
-          </ul>
-        </details>
-      </footer>
     </div>
   );
 }
@@ -4546,7 +4530,7 @@ function fmtDateTime(iso: string): string {
 }
 
 function SettingsView({
-  updateInfo, checking, onRecheck, profile, friendsOnline, recoveryKey, onShowTutorial, onViewProfile,
+  updateInfo, checking, onRecheck, profile, friendsOnline, recoveryKey, onShowTutorial, onViewProfile, recipes, collections,
 }: {
   updateInfo: UpdateInfo | null;
   checking: boolean;
@@ -4556,6 +4540,8 @@ function SettingsView({
   recoveryKey: string | null;
   onShowTutorial: () => void;
   onViewProfile: () => void;
+  recipes: Recipe[];
+  collections: Collection[];
 }) {
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
   const queryClient = useQueryClient();
@@ -4911,7 +4897,7 @@ function SettingsView({
           Your recipes and their photos live in this app, in your own Muse account — never on GitHub,
           never anywhere public. So they can’t be lost, Kitchen Companion keeps automatic backup copies
           of everything (recipes and photos together) inside the app, and you can download a complete
-          backup file of your own from the bottom of the Recipes tab.
+          backup file of your own right below, in this section.
         </p>
         {backupStatus ? (
           <div className="mt-2 space-y-1 text-sm">
@@ -4932,7 +4918,7 @@ function SettingsView({
               {backupStatus.lastBackupAt
                 ? `Last backup you downloaded: ${fmtDateTime(backupStatus.lastBackupAt)}.`
                 : "You haven’t downloaded a backup of your own yet."}{" "}
-              Downloading and restoring both happen at the bottom of the Recipes tab.
+              Downloading and restoring both happen just below, in this section.
             </p>
           </div>
         ) : (
@@ -4940,12 +4926,14 @@ function SettingsView({
         )}
       </section>
 
+      <BackupBar recipes={recipes} collections={collections} profile={profile} />
+
       <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="About">
         <h2 className="font-display text-xl font-bold">About</h2>
         <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
           Kitchen Companion UAT · Version {APP_VERSION}. Your recipes live in this app, in your own
           Muse account. They are backed up automatically inside the app, and you can download a
-          complete backup — recipes and photos together — any time from the bottom of the Recipes tab.
+          complete backup — recipes and photos together — any time from Backup &amp; safety, just above.
           What each version brought is in the change log under App updates, just above.
         </p>
       </section>
