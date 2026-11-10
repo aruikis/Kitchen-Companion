@@ -3,6 +3,11 @@
 Every version, newest first. These are the same notes the app shows in
 Settings → App updates — one list, plain and simple.
 
+## v1.5.1 — 2026-11-09
+- Fixed: your name now reaches the friends list on its own — a friend adding your code won't be told it doesn't exist.
+- If the connection hiccups, the app keeps trying by itself until it gets through.
+- Typing: the box you're typing in now moves into view, so you can always see your words.
+
 ## v1.5.0 — 2026-11-09
 - New: recipes can come in from your email — find the import inbox at the top of the Add tab.
 - Ask your Muse to find recipes in your email, and they wait in the inbox for your OK.

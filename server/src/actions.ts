@@ -1075,46 +1075,68 @@ async function draftFromImage(
 // Vault X uses (Anthony's project, created Nov 2, 2026) — project URL and
 // PUBLISHABLE key below. A publishable key is designed to be embedded in
 // apps (Vault X's ships in its public repo the same way); the project's
-// secret key is never used or stored here. The kc_* tables are created by
-// ONE one-time step in the Supabase SQL editor (see BACKEND-SETUP.md in
-// this repo for the exact SQL). Until that step is done, backend calls
-// answer 404 (PostgREST PGRST205, "table not in schema cache") and every
-// action below reports friendsOnline: false — the app says so in plain
+// secret key is never used or stored here. The kc_* tables were created
+// in the Supabase SQL editor on Nov 9, 2026 and are live (verified by
+// direct reads/writes). If a backend call answers 404 (PostgREST
+// PGRST205, "table not in schema cache") or the connection fails, the
+// actions below report friendsOnline: false — the app says so in plain
 // words and everything local (profile, code, welcome flow, local backup)
-// keeps working. Once the tables exist, the same actions light up with
-// no app update needed.
+// keeps working. Registration is SELF-HEALING: it is attempted when the
+// profile is created, again inside getProfile on every app open while
+// the profile is still unregistered, and by the client's syncProfile
+// retries — and kcFetch itself retries transient failures — so a profile
+// created while the backend was unreachable (exactly what happened to
+// the first two cooks) lands on the backend on a later open with no
+// update and no user action needed.
 
 const KC_BACKEND_URL = "https://iilsbousebrgkmsimucq.supabase.co";
 const KC_PUBLISHABLE_KEY = "sb_publishable_Qi1YZXJNCbiDSTs0pn3fQA_MKai5qNX";
 
 type KcResult<T> = { ok: true; data: T } | { ok: false; status: number };
 
+const KC_RETRY_DELAYS_MS = [0, 400, 1200, 2500];
+
 async function kcFetch<T>(path: string, init?: RequestInit): Promise<KcResult<T>> {
-  try {
-    const res = await fetch(`${KC_BACKEND_URL}/rest/v1/${path}`, {
-      ...init,
-      headers: {
-        apikey: KC_PUBLISHABLE_KEY,
-        Authorization: `Bearer ${KC_PUBLISHABLE_KEY}`,
-        "Content-Type": "application/json",
-        ...(init?.headers ?? {}),
-      },
-    });
-    if (!res.ok) {
-      await res.text().catch(() => "");
-      return { ok: false, status: res.status };
-    }
-    const text = await res.text();
-    let data: T;
+  // Transient connection resets are a real, observed failure on this path
+  // (a single POST dying with ECONNRESET is what silently stranded profile
+  // registrations — Nov 9, 2026: both cooks' profiles existed only on their
+  // own copies, so every code lookup answered "no cook has that code yet").
+  // Every backend write is an idempotent upsert or ignore-duplicates
+  // insert, so retrying is always safe; a 4xx answer is final (a missing
+  // table must still read as "not switched on" without a long stall).
+  let last: KcResult<T> = { ok: false, status: 0 };
+  for (const delay of KC_RETRY_DELAYS_MS) {
+    if (delay > 0) await new Promise((r) => setTimeout(r, delay));
     try {
-      data = (text ? JSON.parse(text) : null) as T;
+      const res = await fetch(`${KC_BACKEND_URL}/rest/v1/${path}`, {
+        ...init,
+        signal: AbortSignal.timeout(10_000),
+        headers: {
+          apikey: KC_PUBLISHABLE_KEY,
+          Authorization: `Bearer ${KC_PUBLISHABLE_KEY}`,
+          "Content-Type": "application/json",
+          ...(init?.headers ?? {}),
+        },
+      });
+      if (!res.ok) {
+        await res.text().catch(() => "");
+        last = { ok: false, status: res.status };
+        if (res.status < 500) return last;
+        continue;
+      }
+      const text = await res.text();
+      let data: T;
+      try {
+        data = (text ? JSON.parse(text) : null) as T;
+      } catch {
+        data = null as T;
+      }
+      return { ok: true, data };
     } catch {
-      data = null as T;
+      last = { ok: false, status: 0 };
     }
-    return { ok: true, data };
-  } catch {
-    return { ok: false, status: 0 };
   }
+  return last;
 }
 
 async function kcFriendsOnline(): Promise<boolean> {
@@ -2171,10 +2193,22 @@ export const Actions = {
     }),
     async handler(ctx) {
       const me = await getLocalProfile(ctx);
-      const [online, syncedRaw] = await Promise.all([
+      let [online, syncedRaw] = await Promise.all([
         kcFriendsOnline(),
         getSetting(ctx, "profile_backend_synced", "0"),
       ]);
+      // Self-heal on every open: a profile created while the backend was
+      // unreachable (or whose one registration attempt died on a transient
+      // connection reset) registers HERE, without waiting for any client
+      // effect — an unregistered profile is invisible to friends' code
+      // lookups, which is the exact failure this prevents from recurring.
+      if (me && online && syncedRaw !== "1") {
+        const synced = await syncProfileToBackend(ctx);
+        if (synced) {
+          syncedRaw = "1";
+          await pushPendingShares(ctx);
+        }
+      }
       return {
         profile: me ? await profileToDto(ctx, me) : null,
         friendsOnline: online,
@@ -2454,9 +2488,18 @@ export const Actions = {
       }
       const online = await kcFriendsOnline();
       if (!online) {
-        return { ok: false, error: "Friends aren't switched on yet — there's one setup step left on our side. Your friend's code will work here the moment it is.", friend: null };
+        return { ok: false, error: "Friends couldn't check in just now — the app couldn't reach the shared server. It keeps trying on its own, and your friend's code will work here the moment it gets through.", friend: null };
       }
-      const target = await kcGetProfileById(code);
+      // Distinguish "the lookup ran and found nobody" from "the lookup
+      // itself failed" — the first is a code problem, the second is a
+      // connection problem, and the message must not blame the code for it.
+      const lookup = await kcFetch<KcProfileRow[]>(
+        `kc_profiles?select=kc_id,username,display_name,photo_data&kc_id=eq.${encodeURIComponent(code)}&limit=1`,
+      );
+      if (!lookup.ok) {
+        return { ok: false, error: "Your friend couldn't be looked up just now — the connection hiccuped. Try again in a moment.", friend: null };
+      }
+      const target = lookup.data[0] ?? null;
       if (!target) {
         return { ok: false, error: "No Kitchen Companion cook has that code yet. Check the code with your friend and try again.", friend: null };
       }

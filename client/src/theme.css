@@ -49,3 +49,13 @@ body {
   background: var(--bg);
   color: var(--text);
 }
+
+/* When a field is scrolled into view (on focus, so typing stays visible
+   above the on-screen keyboard), keep it clear of the fixed bottom bar
+   and the top chrome. */
+input,
+textarea,
+select {
+  scroll-margin-top: 96px;
+  scroll-margin-bottom: 160px;
+}

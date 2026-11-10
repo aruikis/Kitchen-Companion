@@ -1,4 +1,4 @@
-# Kitchen Companion (UAT) — v1.5.0
+# Kitchen Companion (UAT) — v1.5.1
 
 A recipe app built as a Muse space (TypeScript). Save recipes from a link or
 Pinterest pin, scan a cookbook page, upload a file, bring them in from your
@@ -15,13 +15,14 @@ top-rated homemade lasagna. They are loaded by the app's own `seedExamples`
 action; no database is included in this repo, so a fresh install starts empty
 apart from those examples.
 
-## What's new in v1.5.0
+## What's new in v1.5.1
 
-- Recipes can come in from your email: ask your Muse to search your email
-  for recipes from a sender, and what it finds waits in the import inbox for
-  your review — nothing is saved until you approve it.
-- A simple change log: Settings → App updates now ends with "What's new —
-  the change log", a short plain-language list of what each update brought.
+- Fixed: your name now reaches the friends list on its own — a friend adding
+  your code won't be told it doesn't exist.
+- If the connection hiccups, the app keeps trying by itself until it gets
+  through.
+- Typing: the box you're typing in now moves into view, so you can always see
+  your words.
 
 ## Installing (for your Muse)
 

@@ -145,7 +145,7 @@ const JEWEL_URL = "https://www.jewelosco.com/";
 
 // Visible version (Anthony's standing rule: the UAT carries its version
 // number in the app, and the GitHub push of this build is tagged with it).
-const APP_VERSION = "1.5.0";
+const APP_VERSION = "1.5.1";
 
 // Automatic categories (chosen by the app when a recipe is added; the cook
 // can correct them). Mirrors the server's lists in actions.ts.
@@ -512,22 +512,53 @@ export function App() {
     if (profileQ.data && !profileQ.data.profile) setInWelcome(true);
   }, [profileQ.data]);
   // Register on the shared backend (and push any shares made while it was
-  // off) the first time we see it switched on with an unsynced profile.
-  const syncTried = useRef(false);
+  // off) whenever the profile is still unregistered — and KEEP retrying
+  // while the app stays open. This used to be a one-shot attempt: a single
+  // failed try on open (one connection hiccup, or the backend not being
+  // up yet at that moment) latched it off for the whole session, which is
+  // how profiles stayed invisible to friends' code lookups. The server
+  // also heals inside getProfile; this is the second net, and it stops on
+  // its own the moment the profile reports registered.
   useEffect(() => {
-    if (syncTried.current) return;
     const p = profileQ.data;
-    if (!p?.profile) return;
-    syncTried.current = true;
-    if (p.friendsOnline && !p.backendSynced) {
+    if (!p?.profile || !p.friendsOnline || p.backendSynced) return;
+    let cancelled = false;
+    const trySync = () => {
       void api.syncProfile({})
-        .then(() => {
+        .then((r) => {
+          if (cancelled || !r.backendSynced) return;
           queryClient.invalidateQueries({ queryKey: ["profile"] });
           queryClient.invalidateQueries({ queryKey: ["friends"] });
         })
-        .catch(() => { /* the Friends tab shows the state honestly */ });
-    }
+        .catch(() => { /* the Friends tab shows the state honestly; the timer retries */ });
+    };
+    trySync();
+    const timer = setInterval(trySync, 60_000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
   }, [profileQ.data, queryClient]);
+
+  // Typing must stay visible (Liz's report, Nov 9, 2026: "when typing
+  // it's not in the box and I can't see it"). On a phone the on-screen
+  // keyboard plus the fixed bottom bar can leave the focused field
+  // covered, so every time a text field gains focus, bring it to the
+  // middle of the screen once the keyboard has had a moment to open.
+  useEffect(() => {
+    const onFocusIn = (e: FocusEvent) => {
+      const el = e.target;
+      if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) return;
+      if (el.type === "file" || el.type === "checkbox" || el.type === "radio") return;
+      window.setTimeout(() => {
+        if (document.activeElement === el) {
+          el.scrollIntoView({ block: "center", behavior: "smooth" });
+        }
+      }, 350);
+    };
+    document.addEventListener("focusin", onFocusIn);
+    return () => document.removeEventListener("focusin", onFocusIn);
+  }, []);
 
   const recipesQ = useQuery({ queryKey: ["recipes"], queryFn: () => api.listRecipes({}) });
   const collectionsQ = useQuery({ queryKey: ["collections"], queryFn: () => api.listCollections({}) });
@@ -1315,10 +1346,10 @@ function BackupBar({ recipes, collections, profile }: { recipes: Recipe[]; colle
           </button>
           {!status.friendsOnline && (
             <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>
-              The server copy also waits for that one-time setup step on the shared server — creating
-              its Kitchen Companion tables, a two-minute job in the Supabase dashboard; Anthony has
-              the exact instructions. You can switch this on now, and it starts working the moment
-              that step is done.
+              The server copy also needs the app to reach the shared Kitchen Companion server —
+              it couldn’t just now, usually a brief connection hiccup. You can switch this on
+              now, and it starts working the moment the connection lands; the app keeps trying
+              on its own.
             </p>
           )}
           <details className="mt-3">
@@ -1745,10 +1776,10 @@ function WelcomeFlow({ onDone }: { onDone: () => void }) {
             )}
             {!friendsOnline && (
               <p className="mt-4 max-w-md text-sm" style={{ color: "var(--dim)" }}>
-                One honest note: there’s one setup step left, and it’s ours, not yours — the shared
-                server needs its Kitchen Companion tables created, one time only. Anthony has the
-                exact instructions (a two-minute job in the Supabase dashboard). Your code already
-                works — hand it out now, and friends will light up on their own the moment it’s done.
+                One honest note: your app couldn’t reach the shared Kitchen Companion server just
+                now — usually a brief connection hiccup, and nothing you need to fix. It keeps
+                trying on its own until your name is registered. Your code already works — hand
+                it out now, and friends will light up on their own the moment it lands.
               </p>
             )}
           </div>
@@ -1911,14 +1942,14 @@ function FriendsView({
 
       {data && !online && (
         <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="Friends coming on">
-          <h2 className="font-display text-xl font-bold">Friends are nearly switched on</h2>
+          <h2 className="font-display text-xl font-bold">Friends couldn’t check in just now</h2>
           <p className="mt-1 text-sm leading-relaxed" style={{ color: "var(--dim)" }}>
-            Here’s exactly what’s left, so there’s no mystery: the shared Kitchen Companion server
-            needs its tables created — a one-time, two-minute job in the Supabase dashboard, and
-            Anthony has the step-by-step instructions. It’s our step, not yours. The moment it’s
-            done, this page wakes up on its own: adding friends by code, seeing their shares, all of
-            it. Your code already works — hand it out now — and anything you mark to share in the
-            meantime is kept safe and sent then.
+            Your app couldn’t reach the shared Kitchen Companion server on its last try — usually
+            that’s a brief connection hiccup, and there’s nothing for you to fix. The app keeps
+            trying on its own: every time it opens, and once a minute while it stays open, until
+            your name is registered and this page wakes up — adding friends by code, seeing their
+            shares, all of it. Your code already works — hand it out now — and anything you mark
+            to share in the meantime is kept safe and sent then.
           </p>
         </section>
       )}

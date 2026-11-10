@@ -18,6 +18,15 @@ export type VersionNotes = {
 
 export const CHANGELOG: VersionNotes[] = [
   {
+    version: "1.5.1",
+    date: "2026-11-09",
+    notes: [
+      "Fixed: your name now reaches the friends list on its own — a friend adding your code won't be told it doesn't exist.",
+      "If the connection hiccups, the app keeps trying by itself until it gets through.",
+      "Typing: the box you're typing in now moves into view, so you can always see your words.",
+    ],
+  },
+  {
     version: "1.5.0",
     date: "2026-11-09",
     notes: [
