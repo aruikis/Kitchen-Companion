@@ -154,7 +154,7 @@ const JEWEL_URL = "https://www.jewelosco.com/";
 
 // Visible version (Anthony's standing rule: the UAT carries its version
 // number in the app, and the GitHub push of this build is tagged with it).
-const APP_VERSION = "1.6.2";
+const APP_VERSION = "1.7.0";
 
 // Automatic categories (chosen by the app when a recipe is added; the cook
 // can correct them). Mirrors the server's lists in actions.ts.
@@ -834,7 +834,7 @@ export function App() {
 
   if (inWelcome) {
     return (
-      <div className="min-h-screen" style={{ background: "var(--bg)", color: "var(--text)" }}>
+      <div className="kc-screen min-h-screen" style={{ background: "var(--bg)", color: "var(--text)" }}>
         <SafeAreaTopScrim backgroundColor="var(--bg)" />
         <WelcomeFlow
           onDone={() => {
@@ -850,6 +850,21 @@ export function App() {
     <div className="min-h-screen" style={{ background: "var(--bg)", color: "var(--text)" }}>
       <SafeAreaTopScrim backgroundColor="var(--bg)" />
       <main className="mx-auto w-full max-w-3xl px-4 pb-28 pt-4">
+        {/* Bubbly motion (v1.7.0): the wrapper is keyed by which screen
+            is showing, so the glide plays once per navigation — a tab
+            switch, opening a recipe, the check-and-fix screen — and
+            never on in-place updates within a screen. The key changes
+            nothing about where screens land, only how they arrive. */}
+        <div
+          key={
+            view.kind === "recipe"
+              ? `recipe-${view.id}`
+              : view.kind === "review"
+                ? "review"
+                : `tab-${tab}`
+          }
+          className="kc-screen"
+        >
         {view.kind === "recipe" ? (
           <RecipeDetail
             recipeId={view.id}
@@ -951,10 +966,11 @@ export function App() {
             collections={collections}
           />
         )}
+        </div>
       </main>
 
       {showTutorial && (
-        <div className="fixed inset-0 z-50 overflow-y-auto" style={{ background: "var(--bg)" }} role="dialog" aria-label="Tutorial">
+        <div className="kc-sheet fixed inset-0 z-50 overflow-y-auto" style={{ background: "var(--bg)" }} role="dialog" aria-label="Tutorial">
           <Tutorial finishLabel="Done" onFinish={() => setShowTutorial(false)} />
         </div>
       )}
@@ -981,11 +997,18 @@ export function App() {
                 type="button"
                 onClick={() => setTab(key)}
                 aria-current={tab === key ? "page" : undefined}
-                className="flex flex-col items-center gap-0.5 py-2.5 text-xs font-medium"
+                className="kc-nav-btn relative flex flex-col items-center gap-0.5 py-2.5 text-xs font-medium"
                 style={{ color: tab === key ? "var(--accent)" : "var(--dim)" }}
               >
-                <span className="text-xl leading-none">{icon}</span>
-                {label}
+                {tab === key && (
+                  <span
+                    aria-hidden="true"
+                    className="kc-tab-pill absolute left-1/2 top-1 h-9 w-12 rounded-full"
+                    style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}
+                  />
+                )}
+                <span className={`relative text-xl leading-none ${tab === key ? "kc-tab-icon-active" : ""}`}>{icon}</span>
+                <span className="relative">{label}</span>
               </button>
             ))}
           </div>
@@ -1770,7 +1793,7 @@ function Tutorial({ finishLabel, onFinish }: { finishLabel: string; onFinish: ()
   if (!stop) return null;
   return (
     <div className="mx-auto flex min-h-screen w-full max-w-xl flex-col px-6 py-8">
-      <div className="flex flex-1 flex-col items-center justify-center text-center">
+      <div key={step} className="kc-pop flex flex-1 flex-col items-center justify-center text-center">
         <div className="text-6xl" aria-hidden>{stop.icon}</div>
         <h2 className="font-display mt-5 text-2xl font-bold">{stop.title}</h2>
         <p className="mt-3 max-w-md text-base leading-relaxed" style={{ color: "var(--dim)" }}>{stop.body}</p>
@@ -2042,7 +2065,7 @@ function FriendPicker({
     );
   }
   return (
-    <fieldset className="mt-2">
+    <fieldset className="kc-pop mt-2">
       <legend className="text-sm font-semibold">Who should see this?</legend>
       <label className="mt-2 flex items-center gap-2.5 rounded-lg px-3 py-2.5" style={{ background: "var(--surface)", border: "1px solid var(--border)" }}>
         <input
@@ -2065,7 +2088,7 @@ function FriendPicker({
         <span className="text-sm font-semibold">Just the people I pick</span>
       </label>
       {!all && (
-        <div className="mt-2 space-y-2">
+        <div className="kc-pop mt-2 space-y-2">
           {friends.map((f) => (
             <label key={f.kcId} className="flex items-center gap-2.5 rounded-lg px-3 py-2" style={{ background: "var(--surface)", border: "1px solid var(--border)" }}>
               <input
@@ -2416,7 +2439,7 @@ function FriendsView({
   }
 
   return (
-    <div>
+    <div className="kc-screen">
       <h1 className="font-display text-3xl font-bold">Friends</h1>
       <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
         Cook together, apart. Share recipes with the people on your list — only what you choose, nothing else.
@@ -2740,7 +2763,7 @@ function OwnProfilePage({
   };
 
   return (
-    <div>
+    <div className="kc-screen">
       <button type="button" onClick={onBack} aria-label="Back to Friends" className="relative z-10 -ml-2 inline-block px-2 py-2.5 text-sm font-semibold" style={{ color: "var(--herb)" }}>
         ‹ Back to Friends
       </button>
@@ -2783,7 +2806,7 @@ function OwnProfilePage({
         </p>
 
         {editing && (
-          <div className="mt-3 rounded-lg px-3 py-3" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
+          <div className="kc-pop mt-3 rounded-lg px-3 py-3" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
             <label className="text-sm font-semibold" htmlFor="profile-bio">About my cooking</label>
             <textarea
               id="profile-bio"
@@ -2966,7 +2989,7 @@ function FriendProfilePage({
   const collectionsShared = shared.filter((s) => s.kind === "collection").length;
 
   return (
-    <div>
+    <div className="kc-screen">
       <button type="button" onClick={onBack} aria-label="Back to Friends" className="relative z-10 -ml-2 inline-block px-2 py-2.5 text-sm font-semibold" style={{ color: "var(--herb)" }}>
         ‹ Back to Friends
       </button>
@@ -3447,7 +3470,7 @@ function RecipeDetail({
           )}
         </div>
         {catEditing && (
-          <div className="mt-2 space-y-2">
+          <div className="kc-pop mt-2 space-y-2">
             <div>
               <span className="text-xs font-semibold" id="cat-course-label" style={{ color: "var(--dim)" }}>Course</span>
               <div className="mt-1 flex flex-wrap gap-1.5" role="group" aria-labelledby="cat-course-label">
@@ -3557,7 +3580,7 @@ function RecipeDetail({
       </div>
 
       {sharePickerOpen && (
-        <div className="mt-3 rounded-[var(--radius)] px-4 py-3" style={{ background: "var(--surface)", border: "1px solid var(--herb)" }}>
+        <div className="kc-pop mt-3 rounded-[var(--radius)] px-4 py-3" style={{ background: "var(--surface)", border: "1px solid var(--herb)" }}>
           <FriendPicker
             friends={shareFriendsData?.friends ?? []}
             all={shareAll}
@@ -3851,7 +3874,7 @@ function CookMode({ recipe, onClose, onCooked }: { recipe: Recipe; onClose: () =
   const last = idx >= recipe.steps.length - 1;
 
   return (
-    <div className="fixed inset-0 z-50 flex flex-col px-5 py-6" style={{ background: "var(--bg)" }} role="dialog" aria-label="Cook mode">
+    <div className="kc-sheet fixed inset-0 z-50 flex flex-col px-5 py-6" style={{ background: "var(--bg)" }} role="dialog" aria-label="Cook mode">
       <div className="flex items-center justify-between">
         <p className="text-sm font-semibold" style={{ color: "var(--dim)" }}>
           {recipe.title} · Step {idx + 1} of {recipe.steps.length}
@@ -3868,7 +3891,7 @@ function CookMode({ recipe, onClose, onCooked }: { recipe: Recipe; onClose: () =
         <TimerBar timers={timers.timers} dismiss={timers.dismiss} />
       </div>
 
-      <div className="flex flex-1 items-center overflow-y-auto py-6">
+      <div key={idx} className="kc-pop flex flex-1 items-center overflow-y-auto py-6">
         <p className="font-display text-2xl font-medium leading-relaxed sm:text-3xl">{step}</p>
       </div>
 
@@ -5262,8 +5285,8 @@ function Planner({ recipes, onOpen }: { recipes: Recipe[]; onOpen: (id: number) 
       </div>
 
       {picker && (
-        <div className="fixed inset-0 z-50 flex items-end justify-center sm:items-center" style={{ background: "rgba(10,7,5,0.7)" }} role="dialog" aria-label="Choose a recipe to plan">
-          <div className="max-h-[85vh] w-full max-w-lg overflow-y-auto rounded-t-3xl px-5 py-5 sm:rounded-3xl" style={{ background: "var(--surface)" }}>
+        <div className="kc-fade fixed inset-0 z-50 flex items-end justify-center sm:items-center" style={{ background: "rgba(10,7,5,0.7)" }} role="dialog" aria-label="Choose a recipe to plan">
+          <div className="kc-sheet max-h-[85vh] w-full max-w-lg overflow-y-auto rounded-t-3xl px-5 py-5 sm:rounded-3xl" style={{ background: "var(--surface)" }}>
             <div className="flex items-center justify-between">
               <h2 className="font-display text-lg font-bold capitalize">{picker.meal} · {prettyDate(picker.date)}</h2>
               <button type="button" onClick={() => setPicker(null)} aria-label="Close planner picker" className="flex h-9 w-9 items-center justify-center rounded-full" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>

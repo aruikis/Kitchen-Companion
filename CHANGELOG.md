@@ -3,6 +3,11 @@
 Every version, newest first. These are the same notes the app shows in
 Settings → App updates — one list, plain and simple.
 
+## v1.7.0 — 2026-11-09
+- Moving between screens now glides instead of jumping — tabs, recipe pages, and pop-up panels ease in with a soft, springy feel.
+- The tab you pick at the bottom gives a little bounce, so you can see where you landed.
+- It's just the movement that's new — everything is in the same place and works the same way. Try it and tell us if you like it.
+
 ## v1.6.2 — 2026-11-09
 - Recipe cards line up in unison now: the stars and the green Example recipe tag sit at the same height on every card, all the way down the page.
 - Long dish names shrink a little to fit their space, so the full name always shows and every card stays the same height.

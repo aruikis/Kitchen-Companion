@@ -18,6 +18,15 @@ export type VersionNotes = {
 
 export const CHANGELOG: VersionNotes[] = [
   {
+    version: "1.7.0",
+    date: "2026-11-09",
+    notes: [
+      "Moving between screens now glides instead of jumping — tabs, recipe pages, and pop-up panels ease in with a soft, springy feel.",
+      "The tab you pick at the bottom gives a little bounce, so you can see where you landed.",
+      "It's just the movement that's new — everything is in the same place and works the same way. Try it and tell us if you like it.",
+    ],
+  },
+  {
     version: "1.6.2",
     date: "2026-11-09",
     notes: [

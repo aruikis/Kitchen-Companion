@@ -59,3 +59,153 @@ select {
   scroll-margin-top: 96px;
   scroll-margin-bottom: 160px;
 }
+
+/* ---------- bubbly motion (v1.7.0) ----------
+   One shared, gentle spring for moving around the app: screens glide in
+   with a small rise and a soft overshoot, sheets bubble up from the
+   bottom, and small panels pop open. Tuned calm for a kitchen — short
+   (never past ~300ms), transform/opacity only, so a tap is never held
+   up waiting for an animation, and nothing here touches in-place
+   updates (ticking an ingredient, a timer, a list refreshing): those
+   elements simply never carry these classes. */
+:root {
+  --ease-bubble: cubic-bezier(0.34, 1.35, 0.44, 1);
+  --ease-glide: cubic-bezier(0.25, 1.1, 0.35, 1);
+}
+
+@keyframes kc-screen-in {
+  0% {
+    opacity: 0;
+    transform: translateY(10px) scale(0.995);
+  }
+  60% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes kc-sheet-in {
+  0% {
+    opacity: 0;
+    transform: translateY(26px) scale(0.99);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes kc-pop-in {
+  0% {
+    opacity: 0;
+    transform: scale(0.96) translateY(-3px);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+@keyframes kc-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes kc-tab-pop {
+  0% {
+    transform: scale(0.7) translateY(2px);
+  }
+  55% {
+    transform: scale(1.14) translateY(-1px);
+  }
+  100% {
+    transform: scale(1) translateY(0);
+  }
+}
+
+/* The pill is centred with translateX(-50%); the keyframes carry that
+   offset so the animation never fights the positioning. */
+@keyframes kc-pill-in {
+  0% {
+    opacity: 0;
+    transform: translateX(-50%) scale(0.5);
+  }
+  100% {
+    opacity: 1;
+    transform: translateX(-50%) scale(1);
+  }
+}
+
+/* A whole screen arriving (tab switch, recipe page, profile page,
+   check-and-fix). Applied to a wrapper keyed by the screen's identity,
+   so it plays exactly once per navigation — never on re-renders. */
+.kc-screen {
+  animation: kc-screen-in 260ms var(--ease-glide) both;
+}
+
+/* A sheet or dialog bubbling up over the screen (cook mode, the
+   planner's recipe picker, the tutorial). */
+.kc-sheet {
+  animation: kc-sheet-in 300ms var(--ease-bubble) both;
+}
+
+/* A small panel opening in place (share picker, category editor,
+   the friend checklist inside the share picker). */
+.kc-pop {
+  animation: kc-pop-in 190ms var(--ease-bubble) both;
+  transform-origin: top center;
+}
+
+/* A dimmed backdrop fading in behind a sheet. */
+.kc-fade {
+  animation: kc-fade-in 180ms ease-out both;
+}
+
+/* The bottom bar: the newly chosen tab's icon gives a small springy
+   bounce, and a soft bubble pill blooms in behind it. The classes are
+   only present on the active tab, so the animation restarts exactly
+   when the selection moves to a different tab. */
+.kc-tab-icon-active {
+  animation: kc-tab-pop 320ms var(--ease-bubble) both;
+}
+
+.kc-tab-pill {
+  animation: kc-pill-in 260ms var(--ease-bubble) both;
+}
+
+/* Nav buttons answer a press with a tiny squash — feedback only, the
+   tap itself is never delayed. */
+.kc-nav-btn {
+  transition: transform 120ms ease-out;
+}
+.kc-nav-btn:active {
+  transform: scale(0.92);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .kc-screen,
+  .kc-sheet,
+  .kc-pop,
+  .kc-fade,
+  .kc-tab-icon-active,
+  .kc-tab-pill {
+    animation: none;
+  }
+  /* Without the animation the pill still needs its centring offset. */
+  .kc-tab-pill {
+    transform: translateX(-50%);
+  }
+  .kc-nav-btn {
+    transition: none;
+  }
+  .kc-nav-btn:active {
+    transform: none;
+  }
+}
