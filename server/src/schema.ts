@@ -155,6 +155,9 @@ export const localShares = sqliteTable("local_shares", {
   kind: text("kind", { enum: ["recipe", "collection"] }).notNull(),
   title: text("title").notNull(),
   payload: text("payload").notNull().default("{}"),
+  // Who may see this share (v1.6.0): '' = all friends; otherwise a JSON
+  // array of friend KC-IDs — only those friends ever see the share.
+  audience: text("audience").notNull().default(""),
   synced: integer("synced").notNull().default(0),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()

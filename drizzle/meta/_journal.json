@@ -64,6 +64,13 @@
       "when": 1794272765433,
       "tag": "0009_add_profile_bio_and_friend_cache_fields",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1794274598270,
+      "tag": "0010_add_share_audience",
+      "breakpoints": true
     }
   ]
 }

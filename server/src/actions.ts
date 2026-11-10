@@ -1175,11 +1175,31 @@ type KcProfileRow = {
 const KC_SELECT_FULL = "kc_id,username,display_name,photo_data,bio,location,specialties,created_at";
 const KC_SELECT_BIO = "kc_id,username,display_name,photo_data,bio,created_at";
 const KC_SELECT_PLAIN = "kc_id,username,display_name,photo_data,created_at";
+const KC_SELECT_LADDER = [KC_SELECT_FULL, KC_SELECT_BIO, KC_SELECT_PLAIN];
+
+// Speed fix (v1.6.0, Anthony: "friends list still loading very slowly"):
+// every Supabase round trip costs ~0.5–0.8s, and while the profile-extras
+// columns don't exist yet the ladder above burns TWO wasted 400s (~1.3s)
+// before the select that works — inside every single friends read. The
+// worker now remembers which select last worked and goes straight to it,
+// re-checking the full ladder every 10 minutes (so the extras light up
+// on their own once the columns are added, no restart needed).
+let kcSelectMemory: { select: string; at: number } | null = null;
+const KC_MEMORY_TTL_MS = 10 * 60 * 1000;
 
 async function kcSelectProfiles(query: string): Promise<KcProfileRow[] | null> {
-  for (const select of [KC_SELECT_FULL, KC_SELECT_BIO, KC_SELECT_PLAIN]) {
-    const r = await kcFetch<KcProfileRow[]>(`kc_profiles?select=${select}&${query}`, undefined, { fast: true });
+  const mem = kcSelectMemory;
+  if (mem && Date.now() - mem.at < KC_MEMORY_TTL_MS) {
+    const r = await kcFetch<KcProfileRow[]>(`kc_profiles?select=${mem.select}&${query}`, undefined, { fast: true });
     if (r.ok) return r.data;
+    kcSelectMemory = null; // remembered shape stopped working — climb the ladder again
+  }
+  for (const select of KC_SELECT_LADDER) {
+    const r = await kcFetch<KcProfileRow[]>(`kc_profiles?select=${select}&${query}`, undefined, { fast: true });
+    if (r.ok) {
+      kcSelectMemory = { select, at: Date.now() };
+      return r.data;
+    }
   }
   return null;
 }
@@ -1194,6 +1214,11 @@ async function kcGetProfileByUsername(username: string): Promise<KcProfileRow | 
   return rows?.[0] ?? null;
 }
 
+// Same remembered-shape trick as kcSelectProfiles (v1.6.0): writes try
+// the fullest body first, but once a shape is known to work it goes
+// first, so a sync costs one round trip instead of up to three.
+let kcUpsertMemory: { index: number; at: number } | null = null;
+
 async function kcUpsertProfile(p: { kcId: string; username: string; displayName: string; photoData: string | null; bio?: string; location?: string; specialties?: string[] }): Promise<boolean> {
   const base = { kc_id: p.kcId, username: p.username, display_name: p.displayName, photo_data: p.photoData };
   const bodies: Array<Record<string, unknown>> = [
@@ -1201,13 +1226,22 @@ async function kcUpsertProfile(p: { kcId: string; username: string; displayName:
     { ...base, bio: p.bio ?? "" },
     base,
   ];
-  for (const body of bodies) {
+  const order = [0, 1, 2];
+  const mem = kcUpsertMemory;
+  if (mem && Date.now() - mem.at < KC_MEMORY_TTL_MS && mem.index > 0) {
+    order.splice(order.indexOf(mem.index), 1);
+    order.unshift(mem.index);
+  }
+  for (const i of order) {
     const r = await kcFetch<unknown>("kc_profiles?on_conflict=kc_id", {
       method: "POST",
       headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-      body: JSON.stringify(body),
+      body: JSON.stringify(bodies[i]),
     });
-    if (r.ok) return true;
+    if (r.ok) {
+      kcUpsertMemory = { index: i, at: Date.now() };
+      return true;
+    }
   }
   return false;
 }
@@ -1319,18 +1353,7 @@ async function pushPendingShares(ctx: Ctx): Promise<number> {
   const pending = await db.select().from(schema.localShares).where(eq(schema.localShares.synced, 0));
   let pushed = 0;
   for (const s of pending) {
-    let payload: unknown = {};
-    try {
-      payload = JSON.parse(s.payload);
-    } catch {
-      payload = {};
-    }
-    const r = await kcFetch<unknown>("kc_shares?on_conflict=share_key", {
-      method: "POST",
-      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-      body: JSON.stringify({ share_key: s.shareKey, owner_kc_id: me.kcId, kind: s.kind, title: s.title, payload }),
-    });
-    if (r.ok) {
+    if (await pushShareRows(me, s)) {
       await db.update(schema.localShares).set({ synced: 1 }).where(eq(schema.localShares.id, s.id));
       pushed++;
     }
@@ -1374,6 +1397,8 @@ const myShareDto = z.object({
   shareKey: z.string(),
   kind: z.enum(["recipe", "collection"]),
   title: z.string(),
+  // null = shared with all friends; otherwise only these KC-IDs see it.
+  audience: z.array(z.string()).nullable(),
   synced: z.boolean(),
   createdAt: z.string(),
 });
@@ -1400,6 +1425,74 @@ function kcRowToFriend(p: KcProfileRow): FriendDto {
   };
 }
 
+// ---------- share audiences (v1.6.0) ----------
+// Anthony: "Share with friends" shared with EVERYONE at once — he wants
+// to pick the person (his case: the sausage & sauerkraut, for Liz only).
+// A share's audience is stored on the local share row ('' = all friends,
+// otherwise a JSON array of KC-IDs) and enforced on the shared backend
+// WITHOUT any new backend column: a share for all friends keeps its
+// plain share_key (every share made before v1.6.0 works unchanged),
+// while a picked-friends share is written as one backend row per
+// recipient with share_key "<key>#<recipient KC-ID>". Every read path
+// below filters on that suffix against the VIEWER's own code, and the
+// audience also rides inside the payload so saveSharedRecipe can refuse
+// a key that wasn't addressed to the saver.
+
+function parseAudience(raw: string | null | undefined): string[] | null {
+  if (!raw) return null;
+  try {
+    const v: unknown = JSON.parse(raw);
+    if (!Array.isArray(v)) return null;
+    const ids = v.filter((x): x is string => typeof x === "string" && x.length > 0);
+    return ids.length > 0 ? ids : null;
+  } catch {
+    return null;
+  }
+}
+
+function shareKeyVisibleTo(shareKey: string, viewerKcId: string | null): boolean {
+  const hash = shareKey.indexOf("#");
+  if (hash < 0) return true; // plain key: shared with all friends
+  if (!viewerKcId) return false;
+  return shareKey.slice(hash + 1) === viewerKcId;
+}
+
+type ShareRowLike = typeof schema.localShares.$inferSelect;
+
+// Writes (or rewrites) a share's backend rows for its current audience.
+// Returns true when every row landed.
+async function pushShareRows(me: LocalProfileRow, s: ShareRowLike): Promise<boolean> {
+  let payloadObj: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(s.payload);
+    if (parsed && typeof parsed === "object") payloadObj = parsed as Record<string, unknown>;
+  } catch {
+    payloadObj = {};
+  }
+  const audience = parseAudience(s.audience);
+  payloadObj.audience = audience;
+  const keys = audience ? audience.map((kcId) => `${s.shareKey}#${kcId}`) : [s.shareKey];
+  let ok = true;
+  for (const key of keys) {
+    const r = await kcFetch<unknown>("kc_shares?on_conflict=share_key", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify({ share_key: key, owner_kc_id: me.kcId, kind: s.kind, title: s.title, payload: payloadObj }),
+    });
+    if (!r.ok) ok = false;
+  }
+  return ok;
+}
+
+// Removes every backend row belonging to a share — the plain key and
+// every per-recipient "#KC-ID" row — with one LIKE sweep.
+async function deleteShareRows(shareKey: string): Promise<void> {
+  await kcFetch<unknown>(`kc_shares?share_key=like.${encodeURIComponent(`${shareKey}%`)}`, {
+    method: "DELETE",
+    headers: { Prefer: "return=minimal" },
+  });
+}
+
 async function readMyShares(ctx: Ctx): Promise<MyShareDto[]> {
   const db = ctx.db<typeof schema>();
   const me = await getLocalProfile(ctx);
@@ -1409,6 +1502,7 @@ async function readMyShares(ctx: Ctx): Promise<MyShareDto[]> {
     shareKey: s.shareKey,
     kind: s.kind,
     title: s.title,
+    audience: parseAudience(s.audience),
     synced: s.synced === 1,
     createdAt: s.createdAt.toISOString(),
   }));
@@ -1490,7 +1584,9 @@ async function liveFriends(ctx: Ctx, me: LocalProfileRow): Promise<FriendsRespon
       .map((p) => kcRowToFriend(p));
     if (sr.ok) {
       const nameById = new Map(friends.map((f) => [f.kcId, f.displayName || f.username]));
-      sharedWithMe = sr.data.map((s) => ({
+      // Audience filter (v1.6.0): a per-recipient share row ("key#KC-ID")
+      // is visible only to the friend it was addressed to — me.
+      sharedWithMe = sr.data.filter((s) => shareKeyVisibleTo(s.share_key, me.kcId)).map((s) => ({
         shareKey: s.share_key,
         kind: s.kind === "collection" ? "collection" as const : "recipe" as const,
         title: s.title,
@@ -2668,14 +2764,17 @@ export const Actions = {
       })),
     }),
     async handler(ctx, args) {
-      void ctx;
       const fail = { ok: false, shares: [] as never[] };
+      const me = await getLocalProfile(ctx);
       const r = await kcFetch<Array<{ share_key: string; kind: string; title: string; payload: unknown }>>(
         `kc_shares?select=share_key,kind,title,payload&owner_kc_id=eq.${encodeURIComponent(args.kcId)}&order=created_at.desc&limit=20`,
         undefined,
         { fast: true },
       );
       if (!r.ok) return fail;
+      // Audience filter (v1.6.0): shares that friend picked for someone
+      // else never show on their profile as seen by me.
+      const visibleRows = r.data.filter((s) => shareKeyVisibleTo(s.share_key, me?.kcId ?? null));
       // A share's payload is the backup format: photos travel as data
       // URLs assembled by the owner's app. Only small photos ride back to
       // a friend's profile — a big one would make the page crawl, which
@@ -2687,7 +2786,7 @@ export const Actions = {
         if (a.dataBase64.length > 500_000) return null;
         return `data:${a.mimeType};base64,${a.dataBase64}`;
       };
-      const shares = r.data.map((s) => {
+      const shares = visibleRows.map((s) => {
         const parsed = z.object({
           recipes: z.array(z.object({
             title: z.string(),
@@ -2771,6 +2870,28 @@ export const Actions = {
           `kc_friendships?owner_kc_id=eq.${encodeURIComponent(me.kcId)}&friend_kc_id=eq.${encodeURIComponent(args.kcId)}`,
           { method: "DELETE", headers: { Prefer: "return=minimal" } },
         );
+        // Audience cleanup (v1.6.0): any of my shares addressed to this
+        // friend alone lose their backend row for them, and my local
+        // audience lists forget them too — a share left with nobody on
+        // its list is withdrawn entirely.
+        await kcFetch<unknown>(
+          `kc_shares?owner_kc_id=eq.${encodeURIComponent(me.kcId)}&share_key=like.${encodeURIComponent(`%#${args.kcId}`)}`,
+          { method: "DELETE", headers: { Prefer: "return=minimal" } },
+        );
+        const mine = await db.select().from(schema.localShares);
+        for (const s of mine) {
+          const aud = parseAudience(s.audience);
+          if (!aud || !aud.includes(args.kcId)) continue;
+          const rest = aud.filter((id) => id !== args.kcId);
+          if (rest.length === 0) {
+            await db.delete(schema.localShares).where(eq(schema.localShares.id, s.id));
+            await deleteShareRows(s.shareKey);
+          } else {
+            await db.update(schema.localShares)
+              .set({ audience: JSON.stringify(rest) })
+              .where(eq(schema.localShares.id, s.id));
+          }
+        }
       }
       await db.delete(schema.localFriends).where(eq(schema.localFriends.kcId, args.kcId));
       await db.delete(schema.localShared).where(eq(schema.localShared.ownerKcId, args.kcId));
@@ -2785,6 +2906,9 @@ export const Actions = {
       kind: z.enum(["recipe", "collection"]),
       title: z.string().min(1).max(200),
       payloadJson: z.string().min(2).max(25_000_000),
+      // Who receives the share (v1.6.0): null/omitted = all friends;
+      // otherwise only the picked friends' KC-IDs ever see it.
+      audience: z.array(z.string().min(3).max(20)).max(50).nullable().default(null),
     }),
     response: z.object({ ok: z.literal(true), synced: z.boolean() }),
     async handler(ctx, args): Promise<{ ok: true; synced: boolean }> {
@@ -2794,32 +2918,52 @@ export const Actions = {
       } catch {
         throw new Error("createShare: payload is not valid JSON");
       }
+      const audience = args.audience && args.audience.length > 0 ? [...new Set(args.audience)] : null;
       const shareKey = crypto.randomUUID();
       const inserted = await db.insert(schema.localShares).values({
         shareKey,
         kind: args.kind,
         title: args.title,
         payload: args.payloadJson,
+        audience: audience ? JSON.stringify(audience) : "",
         synced: 0,
       }).returning({ id: schema.localShares.id });
       const rowId = inserted[0]?.id;
       let synced = false;
       const me = await getLocalProfile(ctx);
       if (me && rowId != null && (await kcFriendsOnline())) {
-        const r = await kcFetch<unknown>("kc_shares?on_conflict=share_key", {
-          method: "POST",
-          headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-          body: JSON.stringify({
-            share_key: shareKey,
-            owner_kc_id: me.kcId,
-            kind: args.kind,
-            title: args.title,
-            payload: JSON.parse(args.payloadJson) as unknown,
-          }),
-        });
-        if (r.ok) {
+        const row = (await db.select().from(schema.localShares).where(eq(schema.localShares.id, rowId)))[0];
+        if (row && (await pushShareRows(me, row))) {
           synced = true;
           await db.update(schema.localShares).set({ synced: 1 }).where(eq(schema.localShares.id, rowId));
+        }
+      }
+      ctx.invalidateQueries();
+      return { ok: true, synced };
+    },
+  }),
+
+  setShareAudience: defineAction({
+    description: "Changes who can see one of this user's shares: null audience means all friends, otherwise only the listed friends' codes. The share's rows on the shared backend are rewritten to match, so a friend taken off the list stops seeing it (copies they already saved stay theirs).",
+    request: z.object({
+      shareKey: z.string().min(8),
+      audience: z.array(z.string().min(3).max(20)).max(50).nullable(),
+    }),
+    response: z.object({ ok: z.literal(true), synced: z.boolean() }),
+    async handler(ctx, args): Promise<{ ok: true; synced: boolean }> {
+      const db = ctx.db<typeof schema>();
+      const audience = args.audience && args.audience.length > 0 ? [...new Set(args.audience)] : null;
+      await db.update(schema.localShares)
+        .set({ audience: audience ? JSON.stringify(audience) : "", synced: 0 })
+        .where(eq(schema.localShares.shareKey, args.shareKey));
+      let synced = false;
+      const me = await getLocalProfile(ctx);
+      const row = (await db.select().from(schema.localShares).where(eq(schema.localShares.shareKey, args.shareKey)))[0];
+      if (me && row && (await kcFriendsOnline())) {
+        await deleteShareRows(args.shareKey);
+        if (await pushShareRows(me, row)) {
+          synced = true;
+          await db.update(schema.localShares).set({ synced: 1 }).where(eq(schema.localShares.id, row.id));
         }
       }
       ctx.invalidateQueries();
@@ -2834,10 +2978,8 @@ export const Actions = {
     async handler(ctx, args): Promise<{ ok: true }> {
       const db = ctx.db<typeof schema>();
       await db.delete(schema.localShares).where(eq(schema.localShares.shareKey, args.shareKey));
-      await kcFetch<unknown>(`kc_shares?share_key=eq.${encodeURIComponent(args.shareKey)}`, {
-        method: "DELETE",
-        headers: { Prefer: "return=minimal" },
-      });
+      // One sweep removes the plain row and every per-recipient row.
+      await deleteShareRows(args.shareKey);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -2855,12 +2997,25 @@ export const Actions = {
     }),
     async handler(ctx, args) {
       const fail = (error: string) => ({ ok: false, error, imported: 0, photosRestored: 0, recipeId: null });
+      const me = await getLocalProfile(ctx);
+      // Audience check (v1.6.0): a per-recipient key ("key#KC-ID") opens
+      // only for the friend it was addressed to.
+      if (!shareKeyVisibleTo(args.shareKey, me?.kcId ?? null)) {
+        return fail("That share wasn't sent to you, so it can't be saved.");
+      }
       const online = await kcFriendsOnline();
       if (!online) return fail("Friends aren't switched on yet, so this share can't be fetched.");
       const r = await kcFetch<Array<{ payload: unknown }>>(
         `kc_shares?select=payload&share_key=eq.${encodeURIComponent(args.shareKey)}&limit=1`,
       );
       if (!r.ok || !r.data[0]) return fail("That share could not be found any more.");
+      // Belt and braces: the payload itself names its audience when the
+      // share was picked for certain friends.
+      const payloadAudience = (r.data[0].payload as { audience?: unknown } | null)?.audience;
+      if (Array.isArray(payloadAudience) && payloadAudience.length > 0
+        && !(me && payloadAudience.includes(me.kcId))) {
+        return fail("That share wasn't sent to you, so it can't be saved.");
+      }
       const checked = z.object({
         collections: z.array(z.object({ name: z.string() })).default([]),
         recipes: z.array(importRecipeSchema).default([]),

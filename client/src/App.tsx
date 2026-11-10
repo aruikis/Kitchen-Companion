@@ -154,7 +154,7 @@ const JEWEL_URL = "https://www.jewelosco.com/";
 
 // Visible version (Anthony's standing rule: the UAT carries its version
 // number in the app, and the GitHub push of this build is tagged with it).
-const APP_VERSION = "1.5.2";
+const APP_VERSION = "1.6.0";
 
 // Automatic categories (chosen by the app when a recipe is added; the cook
 // can correct them). Mirrors the server's lists in actions.ts.
@@ -506,9 +506,19 @@ function TimerBar({ timers, dismiss }: { timers: RunningTimer[]; dismiss: (id: n
 
 // ---------- app shell ----------
 
+// Where "back" from a recipe page must land (v1.6.0 back audit): the
+// exact screen the recipe was opened from — a profile page peels back to
+// that profile, anything else to the tab the user was on.
+type RecipeReturn =
+  | { kind: "main" }
+  | { kind: "ownProfile" }
+  | { kind: "friendProfile"; kcId: string };
+
 export function App() {
   const [tab, setTab] = useState<Tab>("recipes");
   const [ownProfileSignal, setOwnProfileSignal] = useState(0);
+  const [recipeReturn, setRecipeReturn] = useState<RecipeReturn>({ kind: "main" });
+  const [friendsRestore, setFriendsRestore] = useState<{ target: "own" | string; nonce: number } | null>(null);
   const [view, setView] = useState<View>({ kind: "main" });
   const [inWelcome, setInWelcome] = useState(false);
   const [showTutorial, setShowTutorial] = useState(false);
@@ -623,7 +633,37 @@ export function App() {
   const stagedQ = useQuery({ queryKey: ["stagedImports"], queryFn: () => api.listStagedImports({}) });
   const stagedItems = stagedQ.data?.items ?? [];
 
-  const openRecipe = (id: number) => setView({ kind: "recipe", id });
+  // Friends speed (v1.6.0): warm the Friends tab's queries in the
+  // background as soon as the app opens with a profile, so tapping
+  // Friends paints instantly instead of starting the whole load then.
+  const friendsWarmed = useRef(false);
+  useEffect(() => {
+    if (friendsWarmed.current || !profileQ.data?.profile) return;
+    friendsWarmed.current = true;
+    void queryClient.prefetchQuery({ queryKey: ["friendsCached"], queryFn: () => api.getFriendsCached({}) });
+    void queryClient.prefetchQuery({ queryKey: ["friends"], queryFn: () => api.getFriends({}) });
+  }, [profileQ.data, queryClient]);
+
+  const openRecipe = (id: number, ret: RecipeReturn = { kind: "main" }) => {
+    setRecipeReturn(ret);
+    setView({ kind: "recipe", id });
+  };
+  // One back from a recipe returns to the exact screen it was opened
+  // from: a friend's profile (or your own) reopens where it was; the
+  // tab the user was on was never changed, so anything else just lands
+  // back on it.
+  const backFromRecipe = () => {
+    const ret = recipeReturn;
+    setRecipeReturn({ kind: "main" });
+    setView({ kind: "main" });
+    if (ret.kind === "ownProfile") {
+      setTab("friends");
+      setFriendsRestore({ target: "own", nonce: Date.now() });
+    } else if (ret.kind === "friendProfile") {
+      setTab("friends");
+      setFriendsRestore({ target: ret.kcId, nonce: Date.now() });
+    }
+  };
   const openReview = (draft: NonNullable<Draft>, editingId: number | null, previewUrl: string | null) =>
     setView({ kind: "review", draft, editingId, previewUrl });
   const openStagedReview = (item: StagedItem) => {
@@ -675,7 +715,7 @@ export function App() {
             recipeId={view.id}
             recipes={recipes}
             collections={collections}
-            onBack={() => setView({ kind: "main" })}
+            onBack={backFromRecipe}
             onGoShop={() => { setTab("shop"); setView({ kind: "main" }); }}
             onEdit={(r) =>
               openReview(
@@ -714,10 +754,20 @@ export function App() {
             collections={collections}
             recipes={recipes}
             onDone={(recipeId) => {
+              setRecipeReturn({ kind: "main" });
               if (recipeId != null) setView({ kind: "recipe", id: recipeId });
               else setView({ kind: "main" });
             }}
-            onCancel={() => setView({ kind: "main" })}
+            onCancel={() => {
+              // Back from check-and-fix peels one level (v1.6.0): editing
+              // an existing recipe returns to that recipe's page; a new
+              // import returns to the tab it started from.
+              if (view.kind === "review" && view.editingId != null) {
+                setView({ kind: "recipe", id: view.editingId });
+              } else {
+                setView({ kind: "main" });
+              }
+            }}
           />
         ) : tab === "recipes" ? (
           <Library
@@ -739,7 +789,15 @@ export function App() {
         ) : tab === "shop" ? (
           <GroceryList />
         ) : tab === "friends" ? (
-          <FriendsView profile={profile} recipes={recipes} collections={collections} onOpenRecipe={openRecipe} openOwnProfileSignal={ownProfileSignal} />
+          <FriendsView
+            profile={profile}
+            recipes={recipes}
+            collections={collections}
+            onOpenRecipe={openRecipe}
+            openOwnProfileSignal={ownProfileSignal}
+            restoreSignal={friendsRestore}
+            onBackToSettings={() => setTab("settings")}
+          />
         ) : (
           <SettingsView
             updateInfo={updateInfo}
@@ -1815,14 +1873,179 @@ const SPECIALTY_PRESETS = [
   "Grilling", "Comfort food", "Weeknight easy", "Spicy", "Desserts",
 ];
 
+// ---------- friend picker + my-share rows (v1.6.0) ----------
+// Sharing used to go to every friend at once. The picker lets the cook
+// choose: all friends, or exactly the people ticked. `all` true means no
+// restriction; otherwise `picked` holds the chosen friends' KC-IDs.
+
+function FriendPicker({
+  friends, all, picked, onAll, onToggle,
+}: {
+  friends: FriendInfo[];
+  all: boolean;
+  picked: string[];
+  onAll: (v: boolean) => void;
+  onToggle: (kcId: string) => void;
+}) {
+  if (friends.length === 0) {
+    return (
+      <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>
+        You don’t have any friends on your list yet — add one with their code on the Friends tab first, then you can share with them.
+      </p>
+    );
+  }
+  return (
+    <fieldset className="mt-2">
+      <legend className="text-sm font-semibold">Who should see this?</legend>
+      <label className="mt-2 flex items-center gap-2.5 rounded-lg px-3 py-2.5" style={{ background: "var(--surface)", border: "1px solid var(--border)" }}>
+        <input
+          type="radio"
+          name="share-audience-mode"
+          checked={all}
+          onChange={() => onAll(true)}
+          className="h-4 w-4 shrink-0"
+        />
+        <span className="text-sm font-semibold">All my friends</span>
+      </label>
+      <label className="mt-2 flex items-center gap-2.5 rounded-lg px-3 py-2.5" style={{ background: "var(--surface)", border: "1px solid var(--border)" }}>
+        <input
+          type="radio"
+          name="share-audience-mode"
+          checked={!all}
+          onChange={() => onAll(false)}
+          className="h-4 w-4 shrink-0"
+        />
+        <span className="text-sm font-semibold">Just the people I pick</span>
+      </label>
+      {!all && (
+        <div className="mt-2 space-y-2">
+          {friends.map((f) => (
+            <label key={f.kcId} className="flex items-center gap-2.5 rounded-lg px-3 py-2" style={{ background: "var(--surface)", border: "1px solid var(--border)" }}>
+              <input
+                type="checkbox"
+                checked={picked.includes(f.kcId)}
+                onChange={() => onToggle(f.kcId)}
+                className="h-4 w-4 shrink-0"
+                aria-label={`Share with ${f.displayName || f.username}`}
+              />
+              <Avatar name={f.displayName || f.username} photoData={f.photoData} size={32} />
+              <span className="min-w-0 flex-1 truncate text-sm font-semibold">{f.displayName || f.username}</span>
+              <span className="text-xs" style={{ color: "var(--dim)" }}>@{f.username}</span>
+            </label>
+          ))}
+          {picked.length === 0 && (
+            <p className="text-xs" style={{ color: "var(--dim)" }}>Tick at least one person — or choose “All my friends” above.</p>
+          )}
+        </div>
+      )}
+    </fieldset>
+  );
+}
+
+function audienceLabel(share: FriendsInfo["myShares"][number], friends: FriendInfo[]): string {
+  if (!share.audience) return "Shared with all your friends";
+  const names = share.audience.map((kcId) => {
+    const f = friends.find((x) => x.kcId === kcId);
+    return f ? (f.displayName || f.username) : kcId;
+  });
+  return `Shared only with ${names.join(", ")}`;
+}
+
+// One of my shares, with who can see it and the controls to change that:
+// take one person off a picked list, or stop sharing altogether.
+function MyShareRow({
+  share, friends, busy, onUnshare, onMsg,
+}: {
+  share: FriendsInfo["myShares"][number];
+  friends: FriendInfo[];
+  busy: boolean;
+  onUnshare: (shareKey: string) => void;
+  onMsg: (m: string) => void;
+}) {
+  const queryClient = useQueryClient();
+  const [working, setWorking] = useState(false);
+  const removeRecipient = async (kcId: string) => {
+    if (!share.audience) return;
+    const rest = share.audience.filter((id) => id !== kcId);
+    setWorking(true);
+    try {
+      if (rest.length === 0) {
+        await api.unshare({ shareKey: share.shareKey });
+        onMsg(`“${share.title}” isn’t shared any more — that was the only person on its list.`);
+      } else {
+        await api.setShareAudience({ shareKey: share.shareKey, audience: rest });
+        onMsg(`“${share.title}” — that person won’t see it any more.`);
+      }
+      queryClient.invalidateQueries({ queryKey: ["friends"] });
+      queryClient.invalidateQueries({ queryKey: ["friendsCached"] });
+    } catch {
+      onMsg("That couldn't be changed just now. Try again in a moment.");
+    } finally {
+      setWorking(false);
+    }
+  };
+  return (
+    <li className="rounded-lg px-3 py-2" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
+      <div className="flex items-center gap-3">
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-sm font-bold">{share.kind === "collection" ? "📚 " : "🍽️ "}{share.title}</p>
+          <p className="text-xs" style={{ color: "var(--dim)" }}>
+            {audienceLabel(share, friends)} · {share.synced ? "sent" : "will be sent when friends check in"}
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => onUnshare(share.shareKey)}
+          disabled={busy || working}
+          className="rounded-full px-3 py-1.5 text-xs font-semibold disabled:opacity-50"
+          style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
+        >
+          Stop sharing
+        </button>
+      </div>
+      {share.audience && share.audience.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1.5" aria-label={`People who can see ${share.title}`}>
+          {share.audience.map((kcId) => {
+            const f = friends.find((x) => x.kcId === kcId);
+            const label = f ? (f.displayName || f.username) : kcId;
+            return (
+              <span key={kcId} className="inline-flex items-center gap-1 rounded-full py-1 pl-2.5 pr-1 text-xs font-semibold" style={{ background: "var(--surface)", border: "1px solid var(--border)" }}>
+                {label}
+                <button
+                  type="button"
+                  onClick={() => void removeRecipient(kcId)}
+                  disabled={working}
+                  aria-label={`Stop sharing ${share.title} with ${label}`}
+                  className="flex h-5 w-5 items-center justify-center rounded-full disabled:opacity-50"
+                  style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}
+                >
+                  ✕
+                </button>
+              </span>
+            );
+          })}
+        </div>
+      )}
+    </li>
+  );
+}
+
+// Friends navigation is a small stack (v1.6.0 back audit): the list is
+// the root; opening a profile pushes one level; Back pops exactly one
+// level and lands on the screen that was there before — never out of
+// the tab, never somewhere else.
+type FriendsNav = { kind: "list" } | { kind: "own" } | { kind: "friend"; kcId: string };
+
 function FriendsView({
-  profile, recipes, collections, onOpenRecipe, openOwnProfileSignal = 0,
+  profile, recipes, collections, onOpenRecipe, openOwnProfileSignal = 0, restoreSignal = null, onBackToSettings,
 }: {
   profile: MyProfile | null;
   recipes: Recipe[];
   collections: Collection[];
-  onOpenRecipe: (id: number) => void;
+  onOpenRecipe: (id: number, ret?: RecipeReturn) => void;
   openOwnProfileSignal?: number;
+  restoreSignal?: { target: "own" | string; nonce: number } | null;
+  onBackToSettings?: () => void;
 }) {
   const queryClient = useQueryClient();
   // Cache first (v1.5.2): the tab paints instantly from what this device
@@ -1846,18 +2069,46 @@ function FriendsView({
   const [removingId, setRemovingId] = useState<string | null>(null);
   const [savedIds, setSavedIds] = useState<Record<string, number | null>>({});
   const [shareCollectionId, setShareCollectionId] = useState<number | null>(null);
-  const [selectedKcId, setSelectedKcId] = useState<string | null>(null);
-  const [showOwnProfile, setShowOwnProfile] = useState(false);
+  const [collShareAll, setCollShareAll] = useState(true);
+  const [collSharePicked, setCollSharePicked] = useState<string[]>([]);
+  const [navStack, setNavStack] = useState<FriendsNav[]>([{ kind: "list" }]);
+  const [ownOrigin, setOwnOrigin] = useState<"friends" | "settings">("friends");
+  const nav: FriendsNav = navStack[navStack.length - 1] ?? { kind: "list" };
+  const selectedKcId = nav.kind === "friend" ? nav.kcId : null;
+  const pushNav = (n: FriendsNav) => setNavStack((s) => [...s, n]);
+  const popNav = () => setNavStack((s) => (s.length > 1 ? s.slice(0, -1) : s));
 
-  // Settings' "View my profile page" lands here: each signal bump opens it.
-  const seenSignal = useRef(openOwnProfileSignal);
+  // Settings' "View my profile page" lands here (v1.6.0 fix): the old
+  // code initialised its "already seen" marker from the signal itself,
+  // so arriving from Settings with the profile never opened during this
+  // visit silently did nothing. A non-zero signal on first sight — or
+  // any later bump — opens the profile, entered from Settings so Back
+  // returns there.
+  const seenSignal = useRef<number | null>(null);
   useEffect(() => {
+    if (seenSignal.current === null) {
+      seenSignal.current = openOwnProfileSignal;
+      if (openOwnProfileSignal > 0) {
+        setOwnOrigin("settings");
+        setNavStack([{ kind: "list" }, { kind: "own" }]);
+      }
+      return;
+    }
     if (openOwnProfileSignal !== seenSignal.current) {
       seenSignal.current = openOwnProfileSignal;
-      setShowOwnProfile(true);
-      setSelectedKcId(null);
+      setOwnOrigin("settings");
+      setNavStack([{ kind: "list" }, { kind: "own" }]);
     }
   }, [openOwnProfileSignal]);
+
+  // Back from a recipe opened from a profile lands back on that profile.
+  const seenRestore = useRef(0);
+  useEffect(() => {
+    if (!restoreSignal || restoreSignal.nonce === seenRestore.current) return;
+    seenRestore.current = restoreSignal.nonce;
+    setOwnOrigin("friends");
+    setNavStack([{ kind: "list" }, restoreSignal.target === "own" ? { kind: "own" } : { kind: "friend", kcId: restoreSignal.target }]);
+  }, [restoreSignal]);
 
   // A friend's page detail (share photos + what they've cooked of what
   // they shared) loads only when a friend is actually opened.
@@ -1938,11 +2189,18 @@ function FriendsView({
     setBusy("Sharing…");
     try {
       const payload = await buildSharePayload(inColl, coll.name);
-      const res = await api.createShare({ kind: "collection", title: coll.name, payloadJson: JSON.stringify(payload) });
+      const audience = collShareAll ? null : collSharePicked;
+      const res = await api.createShare({ kind: "collection", title: coll.name, payloadJson: JSON.stringify(payload), audience });
       queryClient.invalidateQueries({ queryKey: ["friends"] });
+      const who = audience
+        ? audience.map((kcId) => {
+            const f = data?.friends.find((x) => x.kcId === kcId);
+            return f ? (f.displayName || f.username) : kcId;
+          }).join(", ")
+        : "your friends";
       setMsg(res.synced
-        ? `“${coll.name}” is shared with your friends — all ${inColl.length} recipes, photos included.`
-        : `“${coll.name}” is marked to share. It will be sent to your friends the moment friends are switched on.`);
+        ? `“${coll.name}” is shared with ${who} — all ${inColl.length} recipes, photos included.`
+        : `“${coll.name}” is marked to share with ${who}. It will be sent the moment friends are switched on.`);
     } catch {
       setMsg("That couldn't be shared just now. Try again in a moment.");
     } finally {
@@ -1963,16 +2221,28 @@ function FriendsView({
     }
   };
 
-  if (showOwnProfile && profile) {
+  if (nav.kind === "own" && profile) {
     return (
       <OwnProfilePage
         profile={profile}
         recipes={recipes}
+        friends={data?.friends ?? []}
         friendsCount={data?.friends.length ?? 0}
         myShares={data?.myShares ?? []}
-        onBack={() => setShowOwnProfile(false)}
-        onOpenRecipe={onOpenRecipe}
+        onBack={() => {
+          // Entered from Settings → back returns to Settings; entered
+          // from the Friends list → back pops to the list. One level.
+          if (ownOrigin === "settings" && onBackToSettings) {
+            setOwnOrigin("friends");
+            setNavStack([{ kind: "list" }]);
+            onBackToSettings();
+          } else {
+            popNav();
+          }
+        }}
+        onOpenRecipe={(id) => onOpenRecipe(id, { kind: "ownProfile" })}
         onUnshare={(shareKey) => void doUnshare(shareKey)}
+        onMsg={setMsg}
       />
     );
   }
@@ -1987,11 +2257,11 @@ function FriendsView({
         detailShares={friendSharesQ.data?.ok ? friendSharesQ.data.shares : []}
         savedIds={savedIds}
         busy={busy != null}
-        onBack={() => setSelectedKcId(null)}
+        onBack={popNav}
         onSaveShared={(shareKey) => void doSaveShared(shareKey)}
-        onOpenRecipe={onOpenRecipe}
+        onOpenRecipe={(id) => onOpenRecipe(id, { kind: "friendProfile", kcId: selectedFriend.kcId })}
         onRemove={() => {
-          setSelectedKcId(null);
+          popNav();
           void doRemove(selectedFriend.kcId);
         }}
       />
@@ -2014,7 +2284,7 @@ function FriendsView({
         <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="Your profile">
           <button
             type="button"
-            onClick={() => setShowOwnProfile(true)}
+            onClick={() => { setOwnOrigin("friends"); pushNav({ kind: "own" }); }}
             aria-label="Open your profile page"
             className="flex w-full items-center gap-3 text-left"
           >
@@ -2088,7 +2358,7 @@ function FriendsView({
                 <li key={f.kcId} className="flex items-center gap-3 rounded-lg px-3 py-2" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
                   <button
                     type="button"
-                    onClick={() => setSelectedKcId(f.kcId)}
+                    onClick={() => pushNav({ kind: "friend", kcId: f.kcId })}
                     aria-label={`Open ${f.displayName || f.username}'s profile`}
                     className="flex min-w-0 flex-1 items-center gap-3 text-left"
                   >
@@ -2187,10 +2457,19 @@ function FriendsView({
                   </button>
                 ))}
               </div>
+              {shareCollectionId != null && (
+                <FriendPicker
+                  friends={data.friends}
+                  all={collShareAll}
+                  picked={collSharePicked}
+                  onAll={setCollShareAll}
+                  onToggle={(kcId) => setCollSharePicked((prev) => (prev.includes(kcId) ? prev.filter((x) => x !== kcId) : [...prev, kcId]))}
+                />
+              )}
               <button
                 type="button"
                 onClick={() => void doShareCollection()}
-                disabled={busy != null || shareCollectionId == null}
+                disabled={busy != null || shareCollectionId == null || (!collShareAll && collSharePicked.length === 0)}
                 className="mt-2 rounded-full px-4 py-2 text-sm font-bold disabled:opacity-50"
                 style={{ background: "var(--herb)", color: "#10240c" }}
               >
@@ -2201,21 +2480,14 @@ function FriendsView({
           {data.myShares.length > 0 ? (
             <ul className="mt-3 space-y-2">
               {data.myShares.map((s) => (
-                <li key={s.shareKey} className="flex items-center gap-3 rounded-lg px-3 py-2" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-bold">{s.kind === "collection" ? "📚 " : "🍽️ "}{s.title}</p>
-                    <p className="text-xs" style={{ color: "var(--dim)" }}>{s.synced ? "Shared with your friends" : "Will be sent when friends are switched on"}</p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => void doUnshare(s.shareKey)}
-                    disabled={busy != null}
-                    className="rounded-full px-3 py-1.5 text-xs font-semibold disabled:opacity-50"
-                    style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
-                  >
-                    Stop sharing
-                  </button>
-                </li>
+                <MyShareRow
+                  key={s.shareKey}
+                  share={s}
+                  friends={data.friends}
+                  busy={busy != null}
+                  onUnshare={(shareKey) => void doUnshare(shareKey)}
+                  onMsg={setMsg}
+                />
               ))}
             </ul>
           ) : (
@@ -2264,15 +2536,17 @@ function ProfileCounts({ counts }: { counts: Array<[string, number]> }) {
 }
 
 function OwnProfilePage({
-  profile, recipes, friendsCount, myShares, onBack, onOpenRecipe, onUnshare,
+  profile, recipes, friends, friendsCount, myShares, onBack, onOpenRecipe, onUnshare, onMsg,
 }: {
   profile: MyProfile;
   recipes: Recipe[];
+  friends: FriendInfo[];
   friendsCount: number;
   myShares: FriendsInfo["myShares"];
   onBack: () => void;
   onOpenRecipe: (id: number) => void;
   onUnshare: (shareKey: string) => void;
+  onMsg: (m: string) => void;
 }) {
   const queryClient = useQueryClient();
   const [copied, setCopied] = useState(false);
@@ -2320,7 +2594,7 @@ function OwnProfilePage({
 
   return (
     <div>
-      <button type="button" onClick={onBack} className="text-sm font-semibold" style={{ color: "var(--herb)" }}>
+      <button type="button" onClick={onBack} aria-label="Back to Friends" className="relative z-10 -ml-2 inline-block px-2 py-2.5 text-sm font-semibold" style={{ color: "var(--herb)" }}>
         ‹ Back to Friends
       </button>
 
@@ -2492,20 +2766,14 @@ function OwnProfilePage({
         {myShares.length > 0 ? (
           <ul className="mt-3 space-y-2">
             {myShares.map((s) => (
-              <li key={s.shareKey} className="flex items-center gap-3 rounded-lg px-3 py-2" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm font-bold">{s.kind === "collection" ? "📚 " : "🍽️ "}{s.title}</p>
-                  <p className="text-xs" style={{ color: "var(--dim)" }}>{s.synced ? "Shared with your friends" : "Will be sent when friends check in"}</p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => onUnshare(s.shareKey)}
-                  className="rounded-full px-3 py-1.5 text-xs font-semibold"
-                  style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
-                >
-                  Stop sharing
-                </button>
-              </li>
+              <MyShareRow
+                key={s.shareKey}
+                share={s}
+                friends={friends}
+                busy={false}
+                onUnshare={onUnshare}
+                onMsg={onMsg}
+              />
             ))}
           </ul>
         ) : (
@@ -2552,7 +2820,7 @@ function FriendProfilePage({
 
   return (
     <div>
-      <button type="button" onClick={onBack} className="text-sm font-semibold" style={{ color: "var(--herb)" }}>
+      <button type="button" onClick={onBack} aria-label="Back to Friends" className="relative z-10 -ml-2 inline-block px-2 py-2.5 text-sm font-semibold" style={{ color: "var(--herb)" }}>
         ‹ Back to Friends
       </button>
 
@@ -2843,17 +3111,42 @@ function RecipeDetail({
     },
   });
   const updateMut = useMutation({ mutationFn: api.updateRecipe, onSuccess: invalidate });
+  // Friend picker (v1.6.0): "Share with friends" now asks WHO first —
+  // all friends, or just the people ticked. The friends list comes from
+  // the same cache-first queries the Friends tab uses.
+  const shareCachedQ = useQuery({
+    queryKey: ["friendsCached"],
+    queryFn: () => api.getFriendsCached({}),
+    staleTime: 30_000,
+  });
+  const shareFriendsListQ = useQuery({
+    queryKey: ["friends"],
+    queryFn: () => api.getFriends({}),
+    staleTime: 60_000,
+  });
+  const shareFriendsData: FriendsInfo | null = shareFriendsListQ.data ?? shareCachedQ.data ?? null;
+  const [sharePickerOpen, setSharePickerOpen] = useState(false);
+  const [shareAll, setShareAll] = useState(true);
+  const [sharePicked, setSharePicked] = useState<string[]>([]);
   const shareFriendsMut = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (audience: string[] | null) => {
       if (!recipe) throw new Error("no recipe");
       const payload = await buildSharePayload([recipe], null);
-      return api.createShare({ kind: "recipe", title: recipe.title, payloadJson: JSON.stringify(payload) });
+      return api.createShare({ kind: "recipe", title: recipe.title, payloadJson: JSON.stringify(payload), audience });
     },
-    onSuccess: (res) => {
+    onSuccess: (res, audience) => {
       queryClient.invalidateQueries({ queryKey: ["friends"] });
+      queryClient.invalidateQueries({ queryKey: ["friendsCached"] });
+      setSharePickerOpen(false);
+      const who = audience
+        ? audience.map((kcId) => {
+            const f = shareFriendsData?.friends.find((x) => x.kcId === kcId);
+            return f ? (f.displayName || f.username) : kcId;
+          }).join(", ")
+        : "your friends";
       setNotice(res.synced
-        ? "Shared with your friends 👥 — they’ll see it under “Shared with you” on their Friends tab."
-        : "Marked to share with your friends 👥 — it will be sent the moment friends are switched on. You can see it on the Friends tab.");
+        ? `Shared with ${who} 👥 — they’ll see it under “Shared with you” on their Friends tab.`
+        : `Marked to share with ${who} 👥 — it will be sent the moment friends are switched on. You can see it on the Friends tab.`);
     },
     onError: () => setNotice("That couldn't be shared just now. Try again in a moment."),
   });
@@ -2865,6 +3158,9 @@ function RecipeDetail({
     setCatCourse(recipe?.course ?? null);
     setCatProtein(recipe?.protein ?? null);
     setCatEditing(false);
+    setSharePickerOpen(false);
+    setShareAll(true);
+    setSharePicked([]);
     // reset per recipe
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [recipeId]);
@@ -2872,7 +3168,7 @@ function RecipeDetail({
   if (!recipe) {
     return (
       <div>
-        <button type="button" onClick={onBack} className="text-sm font-semibold" style={{ color: "var(--accent)" }}>← Back to recipes</button>
+        <button type="button" onClick={onBack} aria-label="Back to the previous screen" className="relative z-10 -ml-2 inline-block px-2 py-2.5 text-sm font-semibold" style={{ color: "var(--accent)" }}>← Back</button>
         <p className="mt-8 text-center" style={{ color: "var(--dim)" }}>That recipe could not be found.</p>
       </div>
     );
@@ -2919,7 +3215,7 @@ function RecipeDetail({
   return (
     <div>
       <div className="flex items-center justify-between">
-        <button type="button" onClick={onBack} className="text-sm font-semibold" style={{ color: "var(--accent)" }}>← Back to recipes</button>
+        <button type="button" onClick={onBack} aria-label="Back to the previous screen" className="relative z-10 -ml-2 inline-block px-2 py-2.5 text-sm font-semibold" style={{ color: "var(--accent)" }}>← Back</button>
         <button
           type="button"
           onClick={() => favMut.mutate({ id: recipe.id, favorite: !recipe.favorite })}
@@ -3104,13 +3400,45 @@ function RecipeDetail({
         <button
           type="button"
           disabled={shareFriendsMut.isPending}
-          onClick={() => shareFriendsMut.mutate()}
+          onClick={() => setSharePickerOpen((o) => !o)}
+          aria-expanded={sharePickerOpen}
           className="col-span-2 rounded-full py-2.5 text-sm font-semibold disabled:opacity-50"
           style={{ background: "var(--surface2)", color: "var(--text)", border: "1px solid var(--border)" }}
         >
           {shareFriendsMut.isPending ? "Sharing…" : "👥 Share with friends"}
         </button>
       </div>
+
+      {sharePickerOpen && (
+        <div className="mt-3 rounded-[var(--radius)] px-4 py-3" style={{ background: "var(--surface)", border: "1px solid var(--herb)" }}>
+          <FriendPicker
+            friends={shareFriendsData?.friends ?? []}
+            all={shareAll}
+            picked={sharePicked}
+            onAll={setShareAll}
+            onToggle={(kcId) => setSharePicked((prev) => (prev.includes(kcId) ? prev.filter((x) => x !== kcId) : [...prev, kcId]))}
+          />
+          <div className="mt-3 flex gap-2">
+            <button
+              type="button"
+              disabled={shareFriendsMut.isPending || (shareFriendsData?.friends.length ?? 0) === 0 || (!shareAll && sharePicked.length === 0)}
+              onClick={() => shareFriendsMut.mutate(shareAll ? null : sharePicked)}
+              className="rounded-full px-4 py-2 text-sm font-bold disabled:opacity-50"
+              style={{ background: "var(--herb)", color: "#10240c" }}
+            >
+              {shareFriendsMut.isPending ? "Sharing…" : "Share it"}
+            </button>
+            <button
+              type="button"
+              onClick={() => setSharePickerOpen(false)}
+              className="rounded-full px-4 py-2 text-sm font-semibold"
+              style={{ background: "var(--surface2)", color: "var(--text)", border: "1px solid var(--border)" }}
+            >
+              Not now
+            </button>
+          </div>
+        </div>
+      )}
 
       {jewelError && !jewelOrder && (
         <p className="mt-3 rounded-[var(--radius)] px-4 py-3 text-sm font-medium" style={{ background: "var(--surface)", border: "1px solid var(--accent)" }} role="alert">
@@ -4021,7 +4349,7 @@ function ReviewForm({
 
   return (
     <div>
-      <button type="button" onClick={onCancel} className="text-sm font-semibold" style={{ color: "var(--accent)" }}>← Back</button>
+      <button type="button" onClick={onCancel} aria-label="Back to the previous screen" className="relative z-10 -ml-2 inline-block px-2 py-2.5 text-sm font-semibold" style={{ color: "var(--accent)" }}>← Back</button>
       <h1 className="font-display mt-2 text-3xl font-bold">{editingId != null ? "Edit recipe" : "Check & fix"}</h1>
       <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
         {editingId != null

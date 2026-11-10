@@ -3,6 +3,15 @@
 Every version, newest first. These are the same notes the app shows in
 Settings → App updates — one list, plain and simple.
 
+## v1.6.0 — 2026-11-09
+- Friends opens faster — the list is ready before you tap, and checks for anything new behind the scenes.
+- Sharing: you can now pick exactly who gets a recipe — just one person, a few, or all your friends.
+- Collections can be shared with picked people too, the same way.
+- Each thing you share now says who can see it, and you can take a person off its list any time.
+- Fixed: Back on your own profile page now returns to your Friends list.
+- Fixed: Back from a recipe now returns to the page you opened it from — your profile, a friend's profile, or the list — and Back from the check-and-fix screen returns to the recipe you were editing.
+- Fixed: “View my profile page” in Settings now opens your profile every time.
+
 ## v1.5.2 — 2026-11-09
 - Friends loads fast now — your list shows right away from your phone, and anything new checks in behind it.
 - New: profile pages. Tap your name — or any friend — to open a profile.
