@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { SafeAreaTopScrim, bytesToBase64 } from "@hatch/space-sdk/client";
 import { api, type ApiResponse } from "./api";
@@ -154,7 +154,7 @@ const JEWEL_URL = "https://www.jewelosco.com/";
 
 // Visible version (Anthony's standing rule: the UAT carries its version
 // number in the app, and the GitHub push of this build is tagged with it).
-const APP_VERSION = "1.6.1";
+const APP_VERSION = "1.6.2";
 
 // Automatic categories (chosen by the app when a recipe is added; the cook
 // can correct them). Mirrors the server's lists in actions.ts.
@@ -371,6 +371,146 @@ function Stars({ value, onSet, size = "text-lg" }: { value: number | null; onSet
         </button>
       ))}
     </span>
+  );
+}
+
+// Recipe-card title with auto-fit sizing (Anthony's rule, Nov 9 2026):
+// every card's title area is the SAME fixed height. A dish name too long
+// for that area steps its font size down (16 → 11px, never smaller, so
+// names stay readable) until the FULL name fits; the name is never cut
+// off with an ellipsis and a long title never pushes its card taller
+// than its neighbours. At the smallest size the name simply wraps inside
+// the same fixed height. The fit is worked out by measuring the name
+// word by word on a canvas with the card's own font, so it is exact for
+// the card's real width — no guessing from character counts.
+const TITLE_FONT_STEPS = [16, 15, 14, 13, 12, 11];
+const TITLE_AREA_HEIGHT = 70; // 3 lines at full size, 5 at the smallest
+
+function titleLineHeight(fontSize: number): number {
+  // Tighter leading as the size steps down, so more lines fit the same
+  // fixed height: 16px→1.375, 13px→1.3, 12px and under→1.25.
+  return fontSize >= 14 ? 1.375 : fontSize === 13 ? 1.3 : 1.25;
+}
+
+let measureCtx: CanvasRenderingContext2D | null = null;
+function getMeasureCtx(): CanvasRenderingContext2D | null {
+  if (measureCtx) return measureCtx;
+  if (typeof document === "undefined") return null;
+  measureCtx = document.createElement("canvas").getContext("2d");
+  return measureCtx;
+}
+
+function fitTitleFontSize(el: HTMLElement, text: string): number {
+  const width = el.clientWidth;
+  const ctx = getMeasureCtx();
+  if (!width || !ctx || !text) return TITLE_FONT_STEPS[0] ?? 16;
+  const family = getComputedStyle(el).fontFamily;
+  for (const size of TITLE_FONT_STEPS) {
+    ctx.font = `700 ${size}px ${family}`;
+    const spaceWidth = ctx.measureText(" ").width;
+    let lines = 1;
+    let lineWidth = 0;
+    for (const word of text.split(/\s+/)) {
+      const wordWidth = ctx.measureText(word).width;
+      if (wordWidth > width) {
+        // One word longer than the whole line: it wraps mid-word.
+        if (lineWidth > 0) lines++;
+        lines += Math.ceil(wordWidth / width) - 1;
+        lineWidth = wordWidth % width;
+      } else if (lineWidth > 0 && lineWidth + spaceWidth + wordWidth > width) {
+        lines++;
+        lineWidth = wordWidth;
+      } else {
+        lineWidth = lineWidth > 0 ? lineWidth + spaceWidth + wordWidth : wordWidth;
+      }
+    }
+    if (lines * size * titleLineHeight(size) <= TITLE_AREA_HEIGHT + 0.5) return size;
+  }
+  return TITLE_FONT_STEPS[TITLE_FONT_STEPS.length - 1] ?? 11;
+}
+
+function FitTitle({ children }: { children: string }) {
+  const ref = useRef<HTMLHeadingElement>(null);
+  const [fontSize, setFontSize] = useState<number>(TITLE_FONT_STEPS[0] ?? 16);
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const fit = () => setFontSize(fitTitleFontSize(el, children));
+    fit();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(fit);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [children]);
+
+  return (
+    <h3
+      ref={ref}
+      className="font-display font-bold"
+      style={{ fontSize, lineHeight: titleLineHeight(fontSize), height: TITLE_AREA_HEIGHT, overflow: "hidden" }}
+    >
+      {children}
+    </h3>
+  );
+}
+
+// One fixed-height line on a recipe card (time/serves, course · protein,
+// cooked status) with the same auto-fit rule as the title: the whole line
+// always shows on ONE line — its font steps down a touch (12 → 10px)
+// rather than the line wrapping and breaking the cards' unison.
+const LINE_FONT_STEPS = [12, 11.5, 11, 10.5, 10];
+
+function FitLine({
+  text,
+  weight = 400,
+  className,
+  style,
+}: {
+  text: string;
+  weight?: number;
+  className?: string;
+  style?: CSSProperties;
+}) {
+  const ref = useRef<HTMLParagraphElement>(null);
+  const [fontSize, setFontSize] = useState<number>(LINE_FONT_STEPS[0] ?? 12);
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const fit = () => {
+      const width = el.clientWidth;
+      const ctx = getMeasureCtx();
+      if (!width || !ctx || !text) {
+        setFontSize(LINE_FONT_STEPS[0] ?? 12);
+        return;
+      }
+      const family = getComputedStyle(el).fontFamily;
+      let chosen = LINE_FONT_STEPS[LINE_FONT_STEPS.length - 1] ?? 10;
+      for (const size of LINE_FONT_STEPS) {
+        ctx.font = `${weight} ${size}px ${family}`;
+        if (ctx.measureText(text).width <= width) {
+          chosen = size;
+          break;
+        }
+      }
+      setFontSize(chosen);
+    };
+    fit();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(fit);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [text, weight]);
+
+  return (
+    <p
+      ref={ref}
+      className={className}
+      style={{ ...style, fontSize, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
+    >
+      {text}
+    </p>
   );
 }
 
@@ -1096,44 +1236,67 @@ function Library({
           return (
             <article
               key={r.id}
-              className="relative overflow-hidden rounded-[var(--radius)] text-left"
+              className="relative flex overflow-hidden rounded-[var(--radius)] text-left"
               style={{ background: "var(--surface)", border: "1px solid var(--border)" }}
             >
-              <button type="button" onClick={() => onOpen(r.id)} className="block w-full text-left" aria-label={`Open ${r.title}`}>
+              <button type="button" onClick={() => onOpen(r.id)} className="flex w-full flex-col text-left" aria-label={`Open ${r.title}`}>
                 <RecipePhoto
                   src={photo}
                   imgClassName="aspect-[4/3] w-full object-cover"
                   placeholderClassName="flex aspect-[4/3] w-full items-center justify-center text-4xl"
                 />
-                <div className="p-3">
-                  <h3 className="font-display text-base font-bold leading-snug">{r.title}</h3>
-                  {r.tags.includes("example") && (
-                    <p className="mt-1.5 inline-block rounded-full px-2 py-0.5 text-[11px] font-bold" style={{ background: "var(--herb)", color: "#10240c" }}>
-                      ⭐ Example recipe
-                    </p>
-                  )}
-                  <p className="mt-1 text-xs" style={{ color: "var(--dim)" }}>
-                    {total ? `${total} min` : ""}
-                    {r.servings ? `${total ? " · " : ""}serves ${r.servings}` : ""}
-                  </p>
-                  {(r.course || r.protein) && (
-                    <p className="mt-0.5 text-xs font-medium" style={{ color: "var(--herb)" }}>
-                      {[r.course, r.protein].filter(Boolean).join(" · ")}
-                    </p>
-                  )}
-                  {r.fridgeHits > 0 && (
-                    <p className="mt-1 text-xs font-semibold" style={{ color: "var(--herb)" }}>
-                      Uses {r.fridgeHits} of your fridge items
-                    </p>
-                  )}
-                  {r.status === "made" ? (
-                    <p className="mt-1 text-xs" style={{ color: "var(--dim)" }}>
-                      Cooked {r.cookCount}×{r.lastCookedAt ? ` · last ${prettyDate(r.lastCookedAt)}` : ""}
-                    </p>
-                  ) : (
-                    <p className="mt-1 text-xs font-medium" style={{ color: "var(--accent)" }}>Want to try</p>
-                  )}
-                  {r.rating != null && <Stars value={r.rating} size="text-sm" />}
+                {/* Identical structure on every card (Anthony's rule, Nov 9
+                    2026): fixed-height auto-fit title, then one block pinned
+                    to the card's bottom whose rows are fixed-height slots —
+                    the green Example line, time/serves, course · protein,
+                    cooked status, and the star row sit at the exact same
+                    height on every card in the row, however long the dish
+                    name above them is. Empty slots keep their height so
+                    nothing shifts up or down between cards. */}
+                <div className="flex flex-1 flex-col p-3">
+                  <FitTitle>{r.title}</FitTitle>
+                  <div className="mt-auto">
+                    <div className="mt-1.5 flex h-5 items-center">
+                      {r.tags.includes("example") && (
+                        <p className="inline-block rounded-full px-2 py-0.5 text-[11px] font-bold" style={{ background: "var(--herb)", color: "#10240c" }}>
+                          ⭐ Example recipe
+                        </p>
+                      )}
+                    </div>
+                    <FitLine
+                      className="mt-1 h-4"
+                      style={{ color: "var(--dim)" }}
+                      text={`${total ? `${total} min` : ""}${r.servings ? `${total ? " · " : ""}serves ${r.servings}` : ""}`}
+                    />
+                    <FitLine
+                      className="mt-0.5 h-4"
+                      weight={500}
+                      style={{ color: "var(--herb)" }}
+                      text={[r.course, r.protein].filter(Boolean).join(" · ")}
+                    />
+                    {r.fridgeHits > 0 && (
+                      <p className="mt-1 text-xs font-semibold" style={{ color: "var(--herb)" }}>
+                        Uses {r.fridgeHits} of your fridge items
+                      </p>
+                    )}
+                    {r.status === "made" ? (
+                      <FitLine
+                        className="mt-1 h-4"
+                        style={{ color: "var(--dim)" }}
+                        text={`Cooked ${r.cookCount}×${r.lastCookedAt ? ` · last ${prettyDate(r.lastCookedAt)}` : ""}`}
+                      />
+                    ) : (
+                      <FitLine
+                        className="mt-1 h-4"
+                        weight={500}
+                        style={{ color: "var(--accent)" }}
+                        text="Want to try"
+                      />
+                    )}
+                    <div className="flex h-5 items-center">
+                      {r.rating != null && <Stars value={r.rating} size="text-sm" />}
+                    </div>
+                  </div>
                 </div>
               </button>
               <button

@@ -3,6 +3,10 @@
 Every version, newest first. These are the same notes the app shows in
 Settings → App updates — one list, plain and simple.
 
+## v1.6.2 — 2026-11-09
+- Recipe cards line up in unison now: the stars and the green Example recipe tag sit at the same height on every card, all the way down the page.
+- Long dish names shrink a little to fit their space, so the full name always shows and every card stays the same height.
+
 ## v1.6.1 — 2026-11-09
 - The Recipes page is just your recipes now — the backup panel and version notes moved off it.
 - Everything backup lives in Settings now: download a backup, restore one, and the extra server copy are all under Backup & safety.

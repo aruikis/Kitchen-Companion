@@ -18,6 +18,14 @@ export type VersionNotes = {
 
 export const CHANGELOG: VersionNotes[] = [
   {
+    version: "1.6.2",
+    date: "2026-11-09",
+    notes: [
+      "Recipe cards line up in unison now: the stars and the green Example recipe tag sit at the same height on every card, all the way down the page.",
+      "Long dish names shrink a little to fit their space, so the full name always shows and every card stays the same height.",
+    ],
+  },
+  {
     version: "1.6.1",
     date: "2026-11-09",
     notes: [
