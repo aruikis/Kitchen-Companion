@@ -95,6 +95,15 @@ export const profiles = sqliteTable("profiles", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   username: text("username").notNull(),
   displayName: text("display_name").notNull().default(""),
+  // Short public "About my cooking" line shown on the profile page and
+  // (once the shared backend carries it) on this cook's friend profile.
+  bio: text("bio").notNull().default(""),
+  // Optional public location line (Cookpad-style, e.g. "Plainfield, IL").
+  // Free text, blank by default, never required.
+  location: text("location").notNull().default(""),
+  // Public favourite-cuisine / specialty chips as a JSON string array
+  // (e.g. ["Polish", "Slow cooker", "Baking"]).
+  specialties: text("specialties").notNull().default("[]"),
   kcId: text("kc_id").notNull(),
   photoKey: text("photo_key"),
   photoData: text("photo_data"),
@@ -112,10 +121,28 @@ export const localFriends = sqliteTable("local_friends", {
   kcId: text("kc_id").primaryKey(),
   username: text("username").notNull(),
   displayName: text("display_name").notNull().default(""),
+  bio: text("bio").notNull().default(""),
+  location: text("location").notNull().default(""),
+  specialties: text("specialties").notNull().default("[]"),
+  joinedAt: text("joined_at"),
   photoData: text("photo_data"),
   addedAt: integer("added_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
+});
+
+// Cache of what friends have shared with this user (v1.5.2). The live list
+// lives on the shared backend; this cache lets the Friends tab — and a
+// friend's own page — render instantly from this device while the live
+// list refreshes in the background, instead of staring at a spinner
+// through several slow server round-trips.
+export const localShared = sqliteTable("local_shared", {
+  shareKey: text("share_key").primaryKey(),
+  kind: text("kind", { enum: ["recipe", "collection"] }).notNull(),
+  title: text("title").notNull(),
+  ownerKcId: text("owner_kc_id").notNull(),
+  ownerName: text("owner_name").notNull().default(""),
+  shareCreatedAt: text("share_created_at").notNull().default(""),
 });
 
 // Recipes/collections this user has chosen to share with friends. The

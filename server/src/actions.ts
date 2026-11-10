@@ -1095,8 +1095,18 @@ const KC_PUBLISHABLE_KEY = "sb_publishable_Qi1YZXJNCbiDSTs0pn3fQA_MKai5qNX";
 type KcResult<T> = { ok: true; data: T } | { ok: false; status: number };
 
 const KC_RETRY_DELAYS_MS = [0, 400, 1200, 2500];
+// Read paths (v1.5.2): the Friends tab felt "way too slow" because every
+// read first paid a full retry ladder (up to 4 attempts × 10s timeouts)
+// per call, several calls deep in series. Reads now get a short ladder —
+// one quick retry — because the Friends tab renders its on-device cache
+// instantly and treats the live read as a background refresh; a missed
+// refresh simply leaves the cache on screen. Writes keep the full ladder:
+// they must land, and they are all idempotent.
+const KC_FAST_RETRY_DELAYS_MS = [0, 350];
 
-async function kcFetch<T>(path: string, init?: RequestInit): Promise<KcResult<T>> {
+async function kcFetch<T>(path: string, init?: RequestInit, opts?: { fast?: boolean }): Promise<KcResult<T>> {
+  const delays = opts?.fast ? KC_FAST_RETRY_DELAYS_MS : KC_RETRY_DELAYS_MS;
+  const timeoutMs = opts?.fast ? 4_000 : 10_000;
   // Transient connection resets are a real, observed failure on this path
   // (a single POST dying with ECONNRESET is what silently stranded profile
   // registrations — Nov 9, 2026: both cooks' profiles existed only on their
@@ -1105,12 +1115,12 @@ async function kcFetch<T>(path: string, init?: RequestInit): Promise<KcResult<T>
   // insert, so retrying is always safe; a 4xx answer is final (a missing
   // table must still read as "not switched on" without a long stall).
   let last: KcResult<T> = { ok: false, status: 0 };
-  for (const delay of KC_RETRY_DELAYS_MS) {
+  for (const delay of delays) {
     if (delay > 0) await new Promise((r) => setTimeout(r, delay));
     try {
       const res = await fetch(`${KC_BACKEND_URL}/rest/v1/${path}`, {
         ...init,
-        signal: AbortSignal.timeout(10_000),
+        signal: AbortSignal.timeout(timeoutMs),
         headers: {
           apikey: KC_PUBLISHABLE_KEY,
           Authorization: `Bearer ${KC_PUBLISHABLE_KEY}`,
@@ -1140,33 +1150,76 @@ async function kcFetch<T>(path: string, init?: RequestInit): Promise<KcResult<T>
 }
 
 async function kcFriendsOnline(): Promise<boolean> {
-  const r = await kcFetch<unknown[]>("kc_profiles?select=kc_id&limit=1");
+  const r = await kcFetch<unknown[]>("kc_profiles?select=kc_id&limit=1", undefined, { fast: true });
   return r.ok;
 }
 
-type KcProfileRow = { kc_id: string; username: string; display_name: string; photo_data: string | null };
+// Public profile extras (v1.5.2): bio ("About my cooking"), location, and
+// favourite-cuisine chips. The shared kc_profiles table gains these
+// columns through a short ALTER in BACKEND-SETUP.md; until that runs,
+// reads/writes naming them fail with a 400, so every call below tries the
+// fullest shape first and falls back step by step — profiles keep working
+// either way, and the extras start flowing to friends the moment the
+// columns exist, with no app update.
+type KcProfileRow = {
+  kc_id: string;
+  username: string;
+  display_name: string;
+  photo_data: string | null;
+  bio?: string | null;
+  location?: string | null;
+  specialties?: string | null;
+  created_at?: string | null;
+};
+
+const KC_SELECT_FULL = "kc_id,username,display_name,photo_data,bio,location,specialties,created_at";
+const KC_SELECT_BIO = "kc_id,username,display_name,photo_data,bio,created_at";
+const KC_SELECT_PLAIN = "kc_id,username,display_name,photo_data,created_at";
+
+async function kcSelectProfiles(query: string): Promise<KcProfileRow[] | null> {
+  for (const select of [KC_SELECT_FULL, KC_SELECT_BIO, KC_SELECT_PLAIN]) {
+    const r = await kcFetch<KcProfileRow[]>(`kc_profiles?select=${select}&${query}`, undefined, { fast: true });
+    if (r.ok) return r.data;
+  }
+  return null;
+}
 
 async function kcGetProfileById(kcId: string): Promise<KcProfileRow | null> {
-  const r = await kcFetch<KcProfileRow[]>(
-    `kc_profiles?select=kc_id,username,display_name,photo_data&kc_id=eq.${encodeURIComponent(kcId)}&limit=1`,
-  );
-  return r.ok ? (r.data[0] ?? null) : null;
+  const rows = await kcSelectProfiles(`kc_id=eq.${encodeURIComponent(kcId)}&limit=1`);
+  return rows?.[0] ?? null;
 }
 
 async function kcGetProfileByUsername(username: string): Promise<KcProfileRow | null> {
-  const r = await kcFetch<KcProfileRow[]>(
-    `kc_profiles?select=kc_id,username,display_name,photo_data&username=ilike.${encodeURIComponent(username)}&limit=1`,
-  );
-  return r.ok ? (r.data[0] ?? null) : null;
+  const rows = await kcSelectProfiles(`username=ilike.${encodeURIComponent(username)}&limit=1`);
+  return rows?.[0] ?? null;
 }
 
-async function kcUpsertProfile(p: { kcId: string; username: string; displayName: string; photoData: string | null }): Promise<boolean> {
-  const r = await kcFetch<unknown>("kc_profiles?on_conflict=kc_id", {
-    method: "POST",
-    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-    body: JSON.stringify({ kc_id: p.kcId, username: p.username, display_name: p.displayName, photo_data: p.photoData }),
-  });
-  return r.ok;
+async function kcUpsertProfile(p: { kcId: string; username: string; displayName: string; photoData: string | null; bio?: string; location?: string; specialties?: string[] }): Promise<boolean> {
+  const base = { kc_id: p.kcId, username: p.username, display_name: p.displayName, photo_data: p.photoData };
+  const bodies: Array<Record<string, unknown>> = [
+    { ...base, bio: p.bio ?? "", location: p.location ?? "", specialties: JSON.stringify(p.specialties ?? []) },
+    { ...base, bio: p.bio ?? "" },
+    base,
+  ];
+  for (const body of bodies) {
+    const r = await kcFetch<unknown>("kc_profiles?on_conflict=kc_id", {
+      method: "POST",
+      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify(body),
+    });
+    if (r.ok) return true;
+  }
+  return false;
+}
+
+function parseSpecialties(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const v: unknown = JSON.parse(raw);
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string").slice(0, 8) : [];
+  } catch {
+    return [];
+  }
 }
 
 // ---------- local profile ----------
@@ -1220,6 +1273,9 @@ async function sha256Hex(text: string): Promise<string> {
 const profileDto = z.object({
   username: z.string(),
   displayName: z.string(),
+  bio: z.string(),
+  location: z.string(),
+  specialties: z.array(z.string()),
   kcId: z.string(),
   photoUrl: z.string().nullable(),
   photoData: z.string().nullable(),
@@ -1230,6 +1286,9 @@ async function profileToDto(ctx: Ctx, row: LocalProfileRow): Promise<z.infer<typ
   return {
     username: row.username,
     displayName: row.displayName,
+    bio: row.bio ?? "",
+    location: row.location ?? "",
+    specialties: parseSpecialties(row.specialties),
     kcId: row.kcId,
     photoUrl: await safePhotoUrl(ctx, row.photoKey),
     photoData: row.photoData,
@@ -1245,6 +1304,9 @@ async function syncProfileToBackend(ctx: Ctx): Promise<boolean> {
     username: me.username,
     displayName: me.displayName,
     photoData: me.photoData,
+    bio: me.bio ?? "",
+    location: me.location ?? "",
+    specialties: parseSpecialties(me.specialties),
   });
   await setSetting(ctx, "profile_backend_synced", ok ? "1" : "0");
   return ok;
@@ -1274,6 +1336,182 @@ async function pushPendingShares(ctx: Ctx): Promise<number> {
     }
   }
   return pushed;
+}
+
+// ---------- friends tab: cache-first reads (v1.5.2) ----------
+// The Friends tab used to wait on the whole live chain — an online probe
+// (full retry ladder), then friendships, profiles, and shares fetched one
+// after another — before painting anything, even though this device
+// already holds a cache of the last-seen list. Now the tab paints from
+// the cache first (getFriendsCached: local database only, no network at
+// all) and the live read (getFriends) refreshes behind it on the fast
+// ladder, in parallel, reconciling the cache for next time. A failed
+// live read falls back to the cache rather than an empty page.
+
+const friendDto = z.object({
+  kcId: z.string(),
+  username: z.string(),
+  displayName: z.string(),
+  bio: z.string(),
+  location: z.string(),
+  specialties: z.array(z.string()),
+  joinedAt: z.string().nullable(),
+  photoData: z.string().nullable(),
+});
+type FriendDto = z.infer<typeof friendDto>;
+
+const sharedWithMeDto = z.object({
+  shareKey: z.string(),
+  kind: z.enum(["recipe", "collection"]),
+  title: z.string(),
+  ownerKcId: z.string(),
+  ownerName: z.string(),
+  createdAt: z.string(),
+});
+type SharedWithMeDto = z.infer<typeof sharedWithMeDto>;
+
+const myShareDto = z.object({
+  shareKey: z.string(),
+  kind: z.enum(["recipe", "collection"]),
+  title: z.string(),
+  synced: z.boolean(),
+  createdAt: z.string(),
+});
+type MyShareDto = z.infer<typeof myShareDto>;
+
+const friendsResponse = z.object({
+  friendsOnline: z.boolean(),
+  friends: z.array(friendDto),
+  sharedWithMe: z.array(sharedWithMeDto),
+  myShares: z.array(myShareDto),
+});
+type FriendsResponse = z.infer<typeof friendsResponse>;
+
+function kcRowToFriend(p: KcProfileRow): FriendDto {
+  return {
+    kcId: p.kc_id,
+    username: p.username,
+    displayName: p.display_name,
+    bio: p.bio ?? "",
+    location: p.location ?? "",
+    specialties: parseSpecialties(p.specialties),
+    joinedAt: p.created_at ?? null,
+    photoData: p.photo_data,
+  };
+}
+
+async function readMyShares(ctx: Ctx): Promise<MyShareDto[]> {
+  const db = ctx.db<typeof schema>();
+  const me = await getLocalProfile(ctx);
+  if (!me) return [];
+  const rows = await db.select().from(schema.localShares).orderBy(desc(schema.localShares.id));
+  return rows.map((s) => ({
+    shareKey: s.shareKey,
+    kind: s.kind,
+    title: s.title,
+    synced: s.synced === 1,
+    createdAt: s.createdAt.toISOString(),
+  }));
+}
+
+async function readCachedFriends(ctx: Ctx): Promise<{ friends: FriendDto[]; sharedWithMe: SharedWithMeDto[] }> {
+  const db = ctx.db<typeof schema>();
+  const friendRows = await db.select().from(schema.localFriends).orderBy(asc(schema.localFriends.addedAt));
+  const shareRows = await db.select().from(schema.localShared);
+  return {
+    friends: friendRows.map((f) => ({
+      kcId: f.kcId,
+      username: f.username,
+      displayName: f.displayName,
+      bio: f.bio ?? "",
+      location: f.location ?? "",
+      specialties: parseSpecialties(f.specialties),
+      joinedAt: f.joinedAt ?? null,
+      photoData: f.photoData,
+    })),
+    sharedWithMe: shareRows
+      .slice()
+      .sort((a, b) => (a.shareCreatedAt < b.shareCreatedAt ? 1 : -1))
+      .map((s) => ({
+        shareKey: s.shareKey,
+        kind: s.kind,
+        title: s.title,
+        ownerKcId: s.ownerKcId,
+        ownerName: s.ownerName,
+        createdAt: s.shareCreatedAt,
+      })),
+  };
+}
+
+async function cacheFriend(ctx: Ctx, f: FriendDto): Promise<void> {
+  const db = ctx.db<typeof schema>();
+  await db.insert(schema.localFriends)
+    .values({
+      kcId: f.kcId, username: f.username, displayName: f.displayName,
+      bio: f.bio, location: f.location, specialties: JSON.stringify(f.specialties),
+      joinedAt: f.joinedAt, photoData: f.photoData,
+    })
+    .onConflictDoUpdate({
+      target: schema.localFriends.kcId,
+      set: {
+        username: f.username, displayName: f.displayName, bio: f.bio,
+        location: f.location, specialties: JSON.stringify(f.specialties),
+        joinedAt: f.joinedAt, photoData: f.photoData,
+      },
+    });
+}
+
+async function liveFriends(ctx: Ctx, me: LocalProfileRow): Promise<FriendsResponse | null> {
+  const db = ctx.db<typeof schema>();
+  const fr = await kcFetch<Array<{ friend_kc_id: string }>>(
+    `kc_friendships?select=friend_kc_id&owner_kc_id=eq.${encodeURIComponent(me.kcId)}&order=created_at.asc`,
+    undefined,
+    { fast: true },
+  );
+  if (!fr.ok) return null;
+  const friendIds = fr.data.map((r) => r.friend_kc_id);
+  let friends: FriendDto[] = [];
+  let sharedWithMe: SharedWithMeDto[] = [];
+  if (friendIds.length > 0) {
+    const inList = friendIds.map((id) => `"${id}"`).join(",");
+    // Profiles and shares don't depend on each other — fetch together.
+    const [profileRows, sr] = await Promise.all([
+      kcSelectProfiles(`kc_id=in.(${encodeURIComponent(inList)})`),
+      kcFetch<Array<{ share_key: string; kind: string; title: string; owner_kc_id: string; created_at: string }>>(
+        `kc_shares?select=share_key,kind,title,owner_kc_id,created_at&owner_kc_id=in.(${encodeURIComponent(inList)})&order=created_at.desc&limit=50`,
+        undefined,
+        { fast: true },
+      ),
+    ]);
+    const byId = new Map((profileRows ?? []).map((p) => [p.kc_id, p]));
+    friends = friendIds
+      .map((id) => byId.get(id))
+      .filter((p): p is KcProfileRow => p != null)
+      .map((p) => kcRowToFriend(p));
+    if (sr.ok) {
+      const nameById = new Map(friends.map((f) => [f.kcId, f.displayName || f.username]));
+      sharedWithMe = sr.data.map((s) => ({
+        shareKey: s.share_key,
+        kind: s.kind === "collection" ? "collection" as const : "recipe" as const,
+        title: s.title,
+        ownerKcId: s.owner_kc_id,
+        ownerName: nameById.get(s.owner_kc_id) ?? "A friend",
+        createdAt: s.created_at,
+      }));
+    }
+  }
+  // Reconcile the on-device caches so the next open paints instantly.
+  await db.delete(schema.localFriends);
+  for (const f of friends) await cacheFriend(ctx, f);
+  await db.delete(schema.localShared);
+  for (const s of sharedWithMe) {
+    await db.insert(schema.localShared).values({
+      shareKey: s.shareKey, kind: s.kind, title: s.title,
+      ownerKcId: s.ownerKcId, ownerName: s.ownerName, shareCreatedAt: s.createdAt,
+    });
+  }
+  await setSetting(ctx, "friends_last_online", "1");
+  return { friendsOnline: true, friends, sharedWithMe, myShares: await readMyShares(ctx) };
 }
 
 // ---------- actions ----------
@@ -2281,9 +2519,12 @@ export const Actions = {
   }),
 
   updateProfile: defineAction({
-    description: "Updates the profile's display name and/or photo (the username and code do not change here), and re-registers on the shared backend when it is on.",
+    description: "Updates the profile's display name, public 'About my cooking' bio, optional location line, favourite-cuisine chips, and/or photo (the username and code do not change here), and re-registers on the shared backend when it is on.",
     request: z.object({
       displayName: z.string().max(60),
+      bio: z.string().max(160).optional(),
+      location: z.string().max(60).optional(),
+      specialties: z.array(z.string().min(1).max(30)).max(8).optional(),
       photo: photoAsset.nullable().default(null),
     }),
     response: z.object({
@@ -2295,10 +2536,15 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const me = await getLocalProfile(ctx);
       if (!me) return { ok: true, profile: null, backendSynced: false };
-      const patch: Partial<{ displayName: string; photoKey: string | null; photoData: string | null; updatedAt: Date }> = {
+      const patch: Partial<{ displayName: string; bio: string; location: string; specialties: string; photoKey: string | null; photoData: string | null; updatedAt: Date }> = {
         displayName: args.displayName.trim(),
         updatedAt: new Date(),
       };
+      if (args.bio !== undefined) patch.bio = args.bio.trim();
+      if (args.location !== undefined) patch.location = args.location.trim();
+      if (args.specialties !== undefined) {
+        patch.specialties = JSON.stringify(args.specialties.map((s) => s.trim()).filter(Boolean).slice(0, 8));
+      }
       if (args.photo) {
         patch.photoKey = await storeBlobAsset(ctx, args.photo, "profile");
         patch.photoData = args.photo.dataBase64.length <= 400_000
@@ -2367,101 +2613,102 @@ export const Actions = {
     },
   }),
 
-  getFriends: defineAction({
-    description: "Returns the friends tab: this user's friends (live from the shared backend when on, last-seen cache when off), what friends have shared with this user, and this user's own shares with their sent status.",
+  getFriendsCached: defineAction({
+    description: "Returns the Friends tab from this device's cache only — friends last seen, what they had shared, and this user's own shares — with no network call at all, so the tab (and a friend's page) paints instantly while getFriends refreshes live data in the background.",
     request: z.object({}),
+    response: friendsResponse,
+    async handler(ctx): Promise<FriendsResponse> {
+      const me = await getLocalProfile(ctx);
+      if (!me) return { friendsOnline: false, friends: [], sharedWithMe: [], myShares: [] };
+      const cached = await readCachedFriends(ctx);
+      return {
+        friendsOnline: (await getSetting(ctx, "friends_last_online", "0")) === "1",
+        friends: cached.friends,
+        sharedWithMe: cached.sharedWithMe,
+        myShares: await readMyShares(ctx),
+      };
+    },
+  }),
+
+  getFriends: defineAction({
+    description: "Returns the Friends tab live from the shared backend on the fast read ladder (profiles and shares fetched in parallel), reconciling this device's cache for next time. If the backend can't be reached, it returns the on-device cache with friendsOnline false instead of an empty page.",
+    request: z.object({}),
+    response: friendsResponse,
+    async handler(ctx): Promise<FriendsResponse> {
+      const me = await getLocalProfile(ctx);
+      if (!me) return { friendsOnline: false, friends: [], sharedWithMe: [], myShares: [] };
+      const live = await liveFriends(ctx, me);
+      if (live) return live;
+      await setSetting(ctx, "friends_last_online", "0");
+      const cached = await readCachedFriends(ctx);
+      return {
+        friendsOnline: false,
+        friends: cached.friends,
+        sharedWithMe: cached.sharedWithMe,
+        myShares: await readMyShares(ctx),
+      };
+    },
+  }),
+
+  getFriendShares: defineAction({
+    description: "Returns one friend's shared recipes/collections in profile-page detail: title, a finished-dish photo when the share carries a small one, and which of those shared recipes the friend has cooked (with when) — the 'recently cooked' strip. Only what that friend explicitly shared is ever read; their un-shared library and cooking stay private. Called when a friend's profile page opens, never on the list itself.",
+    request: z.object({ kcId: z.string().min(3) }),
     response: z.object({
-      friendsOnline: z.boolean(),
-      friends: z.array(z.object({
-        kcId: z.string(),
-        username: z.string(),
-        displayName: z.string(),
+      ok: z.boolean(),
+      shares: z.array(z.object({
+        shareKey: z.string(),
+        kind: z.enum(["recipe", "collection"]),
+        title: z.string(),
         photoData: z.string().nullable(),
-      })),
-      sharedWithMe: z.array(z.object({
-        shareKey: z.string(),
-        kind: z.enum(["recipe", "collection"]),
-        title: z.string(),
-        ownerKcId: z.string(),
-        ownerName: z.string(),
-        createdAt: z.string(),
-      })),
-      myShares: z.array(z.object({
-        shareKey: z.string(),
-        kind: z.enum(["recipe", "collection"]),
-        title: z.string(),
-        synced: z.boolean(),
-        createdAt: z.string(),
+        cooked: z.array(z.object({
+          title: z.string(),
+          lastCookedAt: z.string().nullable(),
+          photoData: z.string().nullable(),
+        })),
       })),
     }),
-    async handler(ctx) {
-      const db = ctx.db<typeof schema>();
-      const me = await getLocalProfile(ctx);
-      const myShareRows = me
-        ? await db.select().from(schema.localShares).orderBy(desc(schema.localShares.id))
-        : [];
-      const myShares = myShareRows.map((s) => ({
-        shareKey: s.shareKey,
-        kind: s.kind,
-        title: s.title,
-        synced: s.synced === 1,
-        createdAt: s.createdAt.toISOString(),
-      }));
-      const offline = { friendsOnline: false, sharedWithMe: [] as never[], myShares };
-      if (!me) return { ...offline, friends: [] };
-      const online = await kcFriendsOnline();
-      if (!online) {
-        const cached = await db.select().from(schema.localFriends).orderBy(asc(schema.localFriends.addedAt));
-        return {
-          ...offline,
-          friends: cached.map((f) => ({ kcId: f.kcId, username: f.username, displayName: f.displayName, photoData: f.photoData })),
-        };
-      }
-      // Live: my friendships → their profiles; reconcile the local cache.
-      const fr = await kcFetch<Array<{ friend_kc_id: string }>>(
-        `kc_friendships?select=friend_kc_id&owner_kc_id=eq.${encodeURIComponent(me.kcId)}&order=created_at.asc`,
+    async handler(ctx, args) {
+      void ctx;
+      const fail = { ok: false, shares: [] as never[] };
+      const r = await kcFetch<Array<{ share_key: string; kind: string; title: string; payload: unknown }>>(
+        `kc_shares?select=share_key,kind,title,payload&owner_kc_id=eq.${encodeURIComponent(args.kcId)}&order=created_at.desc&limit=20`,
+        undefined,
+        { fast: true },
       );
-      const friendIds = fr.ok ? fr.data.map((r) => r.friend_kc_id) : [];
-      let friends: Array<{ kcId: string; username: string; displayName: string; photoData: string | null }> = [];
-      if (friendIds.length > 0) {
-        const inList = friendIds.map((id) => `"${id}"`).join(",");
-        const pr = await kcFetch<KcProfileRow[]>(
-          `kc_profiles?select=kc_id,username,display_name,photo_data&kc_id=in.(${encodeURIComponent(inList)})`,
-        );
-        const byId = new Map((pr.ok ? pr.data : []).map((p) => [p.kc_id, p]));
-        friends = friendIds
-          .map((id) => byId.get(id))
-          .filter((p): p is KcProfileRow => p != null)
-          .map((p) => ({ kcId: p.kc_id, username: p.username, displayName: p.display_name, photoData: p.photo_data }));
-        await db.delete(schema.localFriends);
-        for (const f of friends) {
-          await db.insert(schema.localFriends).values({
-            kcId: f.kcId, username: f.username, displayName: f.displayName, photoData: f.photoData,
-          });
-        }
-      } else {
-        await db.delete(schema.localFriends);
-      }
-      // What those friends have shared (only what they explicitly shared).
-      let sharedWithMe: Array<{ shareKey: string; kind: "recipe" | "collection"; title: string; ownerKcId: string; ownerName: string; createdAt: string }> = [];
-      if (friendIds.length > 0) {
-        const inList = friendIds.map((id) => `"${id}"`).join(",");
-        const sr = await kcFetch<Array<{ share_key: string; kind: string; title: string; owner_kc_id: string; created_at: string }>>(
-          `kc_shares?select=share_key,kind,title,owner_kc_id,created_at&owner_kc_id=in.(${encodeURIComponent(inList)})&order=created_at.desc&limit=50`,
-        );
-        if (sr.ok) {
-          const nameById = new Map(friends.map((f) => [f.kcId, f.displayName || f.username]));
-          sharedWithMe = sr.data.map((s) => ({
-            shareKey: s.share_key,
-            kind: s.kind === "collection" ? "collection" as const : "recipe" as const,
-            title: s.title,
-            ownerKcId: s.owner_kc_id,
-            ownerName: nameById.get(s.owner_kc_id) ?? "A friend",
-            createdAt: s.created_at,
-          }));
-        }
-      }
-      return { friendsOnline: true, friends, sharedWithMe, myShares };
+      if (!r.ok) return fail;
+      // A share's payload is the backup format: photos travel as data
+      // URLs assembled by the owner's app. Only small photos ride back to
+      // a friend's profile — a big one would make the page crawl, which
+      // is the very complaint this build fixes.
+      const smallPhoto = (asset: unknown): string | null => {
+        if (!asset || typeof asset !== "object") return null;
+        const a = asset as { mimeType?: unknown; dataBase64?: unknown };
+        if (typeof a.mimeType !== "string" || typeof a.dataBase64 !== "string") return null;
+        if (a.dataBase64.length > 500_000) return null;
+        return `data:${a.mimeType};base64,${a.dataBase64}`;
+      };
+      const shares = r.data.map((s) => {
+        const parsed = z.object({
+          recipes: z.array(z.object({
+            title: z.string(),
+            cookCount: z.number().default(0),
+            lastCookedAt: z.string().nullable().default(null),
+            dishPhoto: z.unknown().optional(),
+          })).default([]),
+        }).safeParse(s.payload);
+        const recipes = parsed.success ? parsed.data.recipes : [];
+        const first = recipes[0];
+        return {
+          shareKey: s.share_key,
+          kind: s.kind === "collection" ? "collection" as const : "recipe" as const,
+          title: s.title,
+          photoData: first ? smallPhoto(first.dishPhoto) : null,
+          cooked: recipes
+            .filter((x) => x.cookCount > 0 || x.lastCookedAt != null)
+            .map((x) => ({ title: x.title, lastCookedAt: x.lastCookedAt, photoData: smallPhoto(x.dishPhoto) })),
+        };
+      });
+      return { ok: true, shares };
     },
   }),
 
@@ -2471,15 +2718,11 @@ export const Actions = {
     response: z.object({
       ok: z.boolean(),
       error: z.string().nullable(),
-      friend: z.object({
-        kcId: z.string(),
-        username: z.string(),
-        displayName: z.string(),
-        photoData: z.string().nullable(),
-      }).nullable(),
+      friend: friendDto.nullable(),
     }),
     async handler(ctx, args) {
       const db = ctx.db<typeof schema>();
+      void db;
       const me = await getLocalProfile(ctx);
       if (!me) return { ok: false, error: "Create your profile first.", friend: null };
       const code = args.code.trim().toUpperCase();
@@ -2493,13 +2736,11 @@ export const Actions = {
       // Distinguish "the lookup ran and found nobody" from "the lookup
       // itself failed" — the first is a code problem, the second is a
       // connection problem, and the message must not blame the code for it.
-      const lookup = await kcFetch<KcProfileRow[]>(
-        `kc_profiles?select=kc_id,username,display_name,photo_data&kc_id=eq.${encodeURIComponent(code)}&limit=1`,
-      );
-      if (!lookup.ok) {
+      const rows = await kcSelectProfiles(`kc_id=eq.${encodeURIComponent(code)}&limit=1`);
+      if (rows === null) {
         return { ok: false, error: "Your friend couldn't be looked up just now — the connection hiccuped. Try again in a moment.", friend: null };
       }
-      const target = lookup.data[0] ?? null;
+      const target = rows[0] ?? null;
       if (!target) {
         return { ok: false, error: "No Kitchen Companion cook has that code yet. Check the code with your friend and try again.", friend: null };
       }
@@ -2511,18 +2752,10 @@ export const Actions = {
       if (!ins.ok) {
         return { ok: false, error: "Your friend couldn't be added just now. Try again in a moment.", friend: null };
       }
-      await db.insert(schema.localFriends)
-        .values({ kcId: target.kc_id, username: target.username, displayName: target.display_name, photoData: target.photo_data })
-        .onConflictDoUpdate({
-          target: schema.localFriends.kcId,
-          set: { username: target.username, displayName: target.display_name, photoData: target.photo_data },
-        });
+      const friend = kcRowToFriend(target);
+      await cacheFriend(ctx, friend);
       ctx.invalidateQueries();
-      return {
-        ok: true,
-        error: null,
-        friend: { kcId: target.kc_id, username: target.username, displayName: target.display_name, photoData: target.photo_data },
-      };
+      return { ok: true, error: null, friend };
     },
   }),
 
@@ -2540,6 +2773,7 @@ export const Actions = {
         );
       }
       await db.delete(schema.localFriends).where(eq(schema.localFriends.kcId, args.kcId));
+      await db.delete(schema.localShared).where(eq(schema.localShared.ownerKcId, args.kcId));
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -3224,3 +3458,4 @@ export const Actions = {
     },
   }),
 } satisfies ActionsModule;
+

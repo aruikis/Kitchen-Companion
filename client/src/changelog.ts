@@ -18,6 +18,18 @@ export type VersionNotes = {
 
 export const CHANGELOG: VersionNotes[] = [
   {
+    version: "1.5.2",
+    date: "2026-11-09",
+    notes: [
+      "Friends loads fast now — your list shows right away from your phone, and anything new checks in behind it.",
+      "New: profile pages. Tap your name — or any friend — to open a profile.",
+      "Your profile shows your photo, code, when you joined, what you're sharing, and your recently cooked dishes.",
+      "Add a line about your cooking, where you cook, and your favourite things to make.",
+      "A friend's profile shows what they've shared — tap Save to keep a recipe for yourself.",
+      "If a friend hasn't shared anything yet, their page just says so.",
+    ],
+  },
+  {
     version: "1.5.1",
     date: "2026-11-09",
     notes: [

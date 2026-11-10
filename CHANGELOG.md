@@ -3,6 +3,14 @@
 Every version, newest first. These are the same notes the app shows in
 Settings → App updates — one list, plain and simple.
 
+## v1.5.2 — 2026-11-09
+- Friends loads fast now — your list shows right away from your phone, and anything new checks in behind it.
+- New: profile pages. Tap your name — or any friend — to open a profile.
+- Your profile shows your photo, code, when you joined, what you're sharing, and your recently cooked dishes.
+- Add a line about your cooking, where you cook, and your favourite things to make.
+- A friend's profile shows what they've shared — tap Save to keep a recipe for yourself.
+- If a friend hasn't shared anything yet, their page just says so.
+
 ## v1.5.1 — 2026-11-09
 - Fixed: your name now reaches the friends list on its own — a friend adding your code won't be told it doesn't exist.
 - If the connection hiccups, the app keeps trying by itself until it gets through.

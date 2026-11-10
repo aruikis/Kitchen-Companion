@@ -68,6 +68,15 @@ function prettyDate(iso: string): string {
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
 }
 
+// For full timestamps (a profile's joined date arrives as an ISO instant,
+// locally or from the shared directory) — prettyDate above only takes a
+// plain calendar date. Returns "" when the value can't be read as a date.
+function prettyInstant(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+
 function totalMinutes(r: Recipe): number | null {
   const t = (r.prepMinutes ?? 0) + (r.cookMinutes ?? 0);
   return t > 0 ? t : null;
@@ -145,7 +154,7 @@ const JEWEL_URL = "https://www.jewelosco.com/";
 
 // Visible version (Anthony's standing rule: the UAT carries its version
 // number in the app, and the GitHub push of this build is tagged with it).
-const APP_VERSION = "1.5.1";
+const APP_VERSION = "1.5.2";
 
 // Automatic categories (chosen by the app when a recipe is added; the cook
 // can correct them). Mirrors the server's lists in actions.ts.
@@ -499,6 +508,7 @@ function TimerBar({ timers, dismiss }: { timers: RunningTimer[]; dismiss: (id: n
 
 export function App() {
   const [tab, setTab] = useState<Tab>("recipes");
+  const [ownProfileSignal, setOwnProfileSignal] = useState(0);
   const [view, setView] = useState<View>({ kind: "main" });
   const [inWelcome, setInWelcome] = useState(false);
   const [showTutorial, setShowTutorial] = useState(false);
@@ -729,7 +739,7 @@ export function App() {
         ) : tab === "shop" ? (
           <GroceryList />
         ) : tab === "friends" ? (
-          <FriendsView profile={profile} recipes={recipes} collections={collections} onOpenRecipe={openRecipe} />
+          <FriendsView profile={profile} recipes={recipes} collections={collections} onOpenRecipe={openRecipe} openOwnProfileSignal={ownProfileSignal} />
         ) : (
           <SettingsView
             updateInfo={updateInfo}
@@ -739,6 +749,7 @@ export function App() {
             friendsOnline={profileQ.data?.friendsOnline ?? false}
             recoveryKey={profileQ.data?.recoveryKey ?? null}
             onShowTutorial={() => setShowTutorial(true)}
+            onViewProfile={() => { setOwnProfileSignal((s) => s + 1); setTab("friends"); }}
           />
         )}
       </main>
@@ -1797,17 +1808,37 @@ function WelcomeFlow({ onDone }: { onDone: () => void }) {
   );
 }
 
+type FriendInfo = FriendsInfo["friends"][number];
+
+const SPECIALTY_PRESETS = [
+  "Polish", "Italian", "Mexican", "Slow cooker", "Baking",
+  "Grilling", "Comfort food", "Weeknight easy", "Spicy", "Desserts",
+];
+
 function FriendsView({
-  profile, recipes, collections, onOpenRecipe,
+  profile, recipes, collections, onOpenRecipe, openOwnProfileSignal = 0,
 }: {
   profile: MyProfile | null;
   recipes: Recipe[];
   collections: Collection[];
   onOpenRecipe: (id: number) => void;
+  openOwnProfileSignal?: number;
 }) {
   const queryClient = useQueryClient();
-  const friendsQ = useQuery({ queryKey: ["friends"], queryFn: () => api.getFriends({}) });
-  const data: FriendsInfo | null = friendsQ.data ?? null;
+  // Cache first (v1.5.2): the tab paints instantly from what this device
+  // already knows, and the live list refreshes behind it — no more
+  // staring at a spinner while the server makes its rounds.
+  const cachedQ = useQuery({
+    queryKey: ["friendsCached"],
+    queryFn: () => api.getFriendsCached({}),
+    staleTime: 30_000,
+  });
+  const friendsQ = useQuery({
+    queryKey: ["friends"],
+    queryFn: () => api.getFriends({}),
+    staleTime: 60_000,
+  });
+  const data: FriendsInfo | null = friendsQ.data ?? cachedQ.data ?? null;
   const [code, setCode] = useState("");
   const [msg, setMsg] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -1815,8 +1846,30 @@ function FriendsView({
   const [removingId, setRemovingId] = useState<string | null>(null);
   const [savedIds, setSavedIds] = useState<Record<string, number | null>>({});
   const [shareCollectionId, setShareCollectionId] = useState<number | null>(null);
+  const [selectedKcId, setSelectedKcId] = useState<string | null>(null);
+  const [showOwnProfile, setShowOwnProfile] = useState(false);
+
+  // Settings' "View my profile page" lands here: each signal bump opens it.
+  const seenSignal = useRef(openOwnProfileSignal);
+  useEffect(() => {
+    if (openOwnProfileSignal !== seenSignal.current) {
+      seenSignal.current = openOwnProfileSignal;
+      setShowOwnProfile(true);
+      setSelectedKcId(null);
+    }
+  }, [openOwnProfileSignal]);
+
+  // A friend's page detail (share photos + what they've cooked of what
+  // they shared) loads only when a friend is actually opened.
+  const friendSharesQ = useQuery({
+    queryKey: ["friendShares", selectedKcId],
+    queryFn: () => api.getFriendShares({ kcId: selectedKcId ?? "" }),
+    enabled: selectedKcId != null,
+    staleTime: 60_000,
+  });
 
   const online = data?.friendsOnline ?? false;
+  const refreshing = friendsQ.isFetching && cachedQ.data != null && friendsQ.data == null;
 
   const doAdd = async () => {
     setMsg(null);
@@ -1910,23 +1963,69 @@ function FriendsView({
     }
   };
 
+  if (showOwnProfile && profile) {
+    return (
+      <OwnProfilePage
+        profile={profile}
+        recipes={recipes}
+        friendsCount={data?.friends.length ?? 0}
+        myShares={data?.myShares ?? []}
+        onBack={() => setShowOwnProfile(false)}
+        onOpenRecipe={onOpenRecipe}
+        onUnshare={(shareKey) => void doUnshare(shareKey)}
+      />
+    );
+  }
+
+  const selectedFriend: FriendInfo | null =
+    selectedKcId != null ? (data?.friends.find((f) => f.kcId === selectedKcId) ?? null) : null;
+  if (selectedFriend) {
+    return (
+      <FriendProfilePage
+        friend={selectedFriend}
+        shared={data?.sharedWithMe.filter((s) => s.ownerKcId === selectedFriend.kcId) ?? []}
+        detailShares={friendSharesQ.data?.ok ? friendSharesQ.data.shares : []}
+        savedIds={savedIds}
+        busy={busy != null}
+        onBack={() => setSelectedKcId(null)}
+        onSaveShared={(shareKey) => void doSaveShared(shareKey)}
+        onOpenRecipe={onOpenRecipe}
+        onRemove={() => {
+          setSelectedKcId(null);
+          void doRemove(selectedFriend.kcId);
+        }}
+      />
+    );
+  }
+
   return (
     <div>
       <h1 className="font-display text-3xl font-bold">Friends</h1>
       <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
         Cook together, apart. Share recipes with the people on your list — only what you choose, nothing else.
       </p>
+      {refreshing && (
+        <p className="mt-1 text-xs" role="status" style={{ color: "var(--dim)" }}>
+          Showing what this phone last saw — checking for anything new…
+        </p>
+      )}
 
       {profile && (
         <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="Your profile">
-          <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => setShowOwnProfile(true)}
+            aria-label="Open your profile page"
+            className="flex w-full items-center gap-3 text-left"
+          >
             <Avatar name={profile.displayName || profile.username} photoData={profile.photoData} photoUrl={profile.photoUrl} size={56} />
-            <div className="min-w-0">
+            <div className="min-w-0 flex-1">
               <p className="truncate text-lg font-bold">{profile.displayName || profile.username}</p>
               <p className="text-sm" style={{ color: "var(--dim)" }}>@{profile.username}</p>
               <p className="font-display text-base font-bold tracking-wide">{profile.kcId}</p>
             </div>
-          </div>
+            <span className="text-sm font-semibold" style={{ color: "var(--herb)" }}>My profile ›</span>
+          </button>
           <button
             type="button"
             onClick={async () => setCopied(await copyText(profile.kcId))}
@@ -1938,7 +2037,7 @@ function FriendsView({
         </section>
       )}
 
-      {friendsQ.isPending && <p className="mt-4 text-sm" role="status" style={{ color: "var(--dim)" }}>Loading your friends…</p>}
+      {data == null && friendsQ.isPending && <p className="mt-4 text-sm" role="status" style={{ color: "var(--dim)" }}>Loading your friends…</p>}
 
       {data && !online && (
         <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="Friends coming on">
@@ -1987,11 +2086,19 @@ function FriendsView({
             <ul className="mt-4 space-y-2">
               {data.friends.map((f) => (
                 <li key={f.kcId} className="flex items-center gap-3 rounded-lg px-3 py-2" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
-                  <Avatar name={f.displayName || f.username} photoData={f.photoData} size={40} />
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-bold">{f.displayName || f.username}</p>
-                    <p className="text-xs" style={{ color: "var(--dim)" }}>@{f.username} · {f.kcId}</p>
-                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedKcId(f.kcId)}
+                    aria-label={`Open ${f.displayName || f.username}'s profile`}
+                    className="flex min-w-0 flex-1 items-center gap-3 text-left"
+                  >
+                    <Avatar name={f.displayName || f.username} photoData={f.photoData} size={40} />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-sm font-bold">{f.displayName || f.username}</span>
+                      <span className="block text-xs" style={{ color: "var(--dim)" }}>@{f.username} · {f.kcId}</span>
+                    </span>
+                    <span aria-hidden className="text-base" style={{ color: "var(--dim)" }}>›</span>
+                  </button>
                   <button
                     type="button"
                     onClick={() => (removingId === f.kcId ? void doRemove(f.kcId) : setRemovingId(f.kcId))}
@@ -2119,6 +2226,445 @@ function FriendsView({
 
       {busy && <p className="mt-3 text-sm" role="status" style={{ color: "var(--dim)" }}>{busy}</p>}
       {msg && <p className="mt-3 text-sm" role="status" style={{ color: "var(--herb)" }}>{msg}</p>}
+    </div>
+  );
+}
+
+// ---------- profile pages (v1.5.2) ----------
+// Your own profile page and a friend's profile page. A profile shows
+// only public things: photo, name, @username, code, joined date, the
+// "About my cooking" line, an optional location, favourite-things chips,
+// and what that cook has chosen to share. The private backup key and the
+// un-shared library NEVER appear here — or anywhere a friend can see.
+
+function SpecialtyChips({ items }: { items: string[] }) {
+  if (items.length === 0) return null;
+  return (
+    <div className="mt-3 flex flex-wrap gap-1.5" aria-label="Favourite things to cook">
+      {items.map((s) => (
+        <span key={s} className="rounded-full px-2.5 py-1 text-xs font-semibold" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
+          {s}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function ProfileCounts({ counts }: { counts: Array<[string, number]> }) {
+  return (
+    <div className="mt-4 grid grid-cols-2 gap-2" role="group" aria-label="Profile counts">
+      {counts.map(([label, n]) => (
+        <div key={label} className="rounded-lg px-3 py-2 text-center" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
+          <p className="font-display text-xl font-bold">{n}</p>
+          <p className="text-xs" style={{ color: "var(--dim)" }}>{label}</p>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function OwnProfilePage({
+  profile, recipes, friendsCount, myShares, onBack, onOpenRecipe, onUnshare,
+}: {
+  profile: MyProfile;
+  recipes: Recipe[];
+  friendsCount: number;
+  myShares: FriendsInfo["myShares"];
+  onBack: () => void;
+  onOpenRecipe: (id: number) => void;
+  onUnshare: (shareKey: string) => void;
+}) {
+  const queryClient = useQueryClient();
+  const [copied, setCopied] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [bioDraft, setBioDraft] = useState(profile.bio);
+  const [locationDraft, setLocationDraft] = useState(profile.location);
+  const [chips, setChips] = useState<string[]>(profile.specialties);
+  const [customChip, setCustomChip] = useState("");
+  const [saveMsg, setSaveMsg] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const recentlyCooked = recipes
+    .filter((r) => r.cookCount > 0)
+    .slice()
+    .sort((a, b) => (b.lastCookedAt ?? "").localeCompare(a.lastCookedAt ?? ""))
+    .slice(0, 6);
+  const recipesShared = myShares.filter((s) => s.kind === "recipe").length;
+  const collectionsShared = myShares.filter((s) => s.kind === "collection").length;
+
+  const toggleChip = (chip: string) =>
+    setChips((prev) => (prev.includes(chip) ? prev.filter((c) => c !== chip) : prev.length >= 8 ? prev : [...prev, chip]));
+
+  const doSave = async () => {
+    setSaving(true);
+    setSaveMsg(null);
+    try {
+      await api.updateProfile({
+        displayName: profile.displayName,
+        bio: bioDraft,
+        location: locationDraft,
+        specialties: chips,
+        photo: null,
+      });
+      queryClient.invalidateQueries({ queryKey: ["profile"] });
+      queryClient.invalidateQueries({ queryKey: ["friends"] });
+      queryClient.invalidateQueries({ queryKey: ["friendsCached"] });
+      setEditing(false);
+      setSaveMsg("Your profile is saved — friends see the new details on your profile page.");
+    } catch {
+      setSaveMsg("That couldn't be saved just now. Try again in a moment.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div>
+      <button type="button" onClick={onBack} className="text-sm font-semibold" style={{ color: "var(--herb)" }}>
+        ‹ Back to Friends
+      </button>
+
+      <section className="mt-3 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="Your profile page">
+        <div className="flex items-center gap-3">
+          <Avatar name={profile.displayName || profile.username} photoData={profile.photoData} photoUrl={profile.photoUrl} size={72} />
+          <div className="min-w-0">
+            <h1 className="truncate font-display text-2xl font-bold">{profile.displayName || profile.username}</h1>
+            <p className="text-sm" style={{ color: "var(--dim)" }}>@{profile.username}</p>
+            {profile.location && <p className="text-sm" style={{ color: "var(--dim)" }}>📍 {profile.location}</p>}
+            {prettyInstant(profile.createdAt) && <p className="text-sm" style={{ color: "var(--dim)" }}>Cooking with Kitchen Companion since {prettyInstant(profile.createdAt)}</p>}
+          </div>
+        </div>
+        {profile.bio && <p className="mt-3 text-base leading-relaxed">{profile.bio}</p>}
+        <SpecialtyChips items={profile.specialties} />
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <span className="font-display text-base font-bold tracking-wide">{profile.kcId}</span>
+          <button
+            type="button"
+            onClick={async () => setCopied(await copyText(profile.kcId))}
+            className="rounded-full px-4 py-2 text-sm font-semibold"
+            style={{ background: "var(--surface2)", color: "var(--text)", border: "1px solid var(--border)" }}
+          >
+            {copied ? "✓ Code copied" : "📋 Copy my code"}
+          </button>
+          {!editing && (
+            <button
+              type="button"
+              onClick={() => { setBioDraft(profile.bio); setLocationDraft(profile.location); setChips(profile.specialties); setEditing(true); }}
+              className="rounded-full px-4 py-2 text-sm font-semibold"
+              style={{ background: "var(--surface2)", color: "var(--text)", border: "1px solid var(--border)" }}
+            >
+              ✏️ Edit my profile
+            </button>
+          )}
+        </div>
+        <p className="mt-2 text-xs" style={{ color: "var(--dim)" }}>
+          This is the page your friends see. Your name and photo change in Settings; your code never changes.
+        </p>
+
+        {editing && (
+          <div className="mt-3 rounded-lg px-3 py-3" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
+            <label className="text-sm font-semibold" htmlFor="profile-bio">About my cooking</label>
+            <textarea
+              id="profile-bio"
+              value={bioDraft}
+              onChange={(e) => setBioDraft(e.target.value)}
+              maxLength={160}
+              rows={2}
+              placeholder="A line or two about how you cook — “Weeknight dinners for two, big Polish Sundays.”"
+              className="mt-1 w-full rounded-lg px-3 py-2 text-base outline-none"
+              style={{ background: "var(--surface)", border: "1px solid var(--border)", color: "var(--text)" }}
+            />
+            <label className="mt-3 block text-sm font-semibold" htmlFor="profile-location">Where I cook (optional)</label>
+            <input
+              id="profile-location"
+              value={locationDraft}
+              onChange={(e) => setLocationDraft(e.target.value)}
+              maxLength={60}
+              placeholder="Plainfield, IL"
+              className="mt-1 w-full rounded-lg px-3 py-2 text-base outline-none"
+              style={{ background: "var(--surface)", border: "1px solid var(--border)", color: "var(--text)" }}
+            />
+            <p className="mt-3 text-sm font-semibold">My favourite things to cook</p>
+            <div className="mt-1.5 flex flex-wrap gap-1.5" role="group" aria-label="Pick your favourite things to cook">
+              {SPECIALTY_PRESETS.map((chip) => (
+                <button
+                  key={chip}
+                  type="button"
+                  aria-pressed={chips.includes(chip)}
+                  onClick={() => toggleChip(chip)}
+                  className="rounded-full px-3 py-1.5 text-sm font-semibold"
+                  style={{
+                    background: chips.includes(chip) ? "var(--accent)" : "var(--surface)",
+                    color: chips.includes(chip) ? "var(--accent-ink)" : "var(--text)",
+                    border: "1px solid var(--border)",
+                  }}
+                >
+                  {chip}
+                </button>
+              ))}
+              {chips.filter((c) => !SPECIALTY_PRESETS.includes(c)).map((chip) => (
+                <button
+                  key={chip}
+                  type="button"
+                  aria-pressed
+                  onClick={() => toggleChip(chip)}
+                  className="rounded-full px-3 py-1.5 text-sm font-semibold"
+                  style={{ background: "var(--accent)", color: "var(--accent-ink)", border: "1px solid var(--border)" }}
+                >
+                  {chip} ✕
+                </button>
+              ))}
+            </div>
+            <div className="mt-2 flex gap-2">
+              <label className="sr-only" htmlFor="profile-custom-chip">Add your own favourite</label>
+              <input
+                id="profile-custom-chip"
+                value={customChip}
+                onChange={(e) => setCustomChip(e.target.value)}
+                maxLength={30}
+                placeholder="Add your own…"
+                className="min-w-0 flex-1 rounded-lg px-3 py-2 text-base outline-none"
+                style={{ background: "var(--surface)", border: "1px solid var(--border)", color: "var(--text)" }}
+              />
+              <button
+                type="button"
+                disabled={!customChip.trim() || chips.length >= 8}
+                onClick={() => { toggleChip(customChip.trim()); setCustomChip(""); }}
+                className="rounded-full px-4 py-2 text-sm font-semibold disabled:opacity-50"
+                style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
+              >
+                Add
+              </button>
+            </div>
+            <div className="mt-3 flex gap-2">
+              <button
+                type="button"
+                onClick={() => void doSave()}
+                disabled={saving}
+                className="rounded-full px-4 py-2 text-sm font-bold disabled:opacity-50"
+                style={{ background: "var(--herb)", color: "#10240c" }}
+              >
+                {saving ? "Saving…" : "Save my profile"}
+              </button>
+              <button
+                type="button"
+                onClick={() => setEditing(false)}
+                disabled={saving}
+                className="rounded-full px-4 py-2 text-sm font-semibold disabled:opacity-50"
+                style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+        {saveMsg && <p className="mt-2 text-sm" role="status" style={{ color: "var(--herb)" }}>{saveMsg}</p>}
+
+        <ProfileCounts counts={[
+          ["Recipes in your library", recipes.length],
+          ["Friends", friendsCount],
+          ["Recipes shared", recipesShared],
+          ["Collections shared", collectionsShared],
+        ]} />
+      </section>
+
+      {recentlyCooked.length > 0 && (
+        <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="Recently cooked">
+          <h2 className="font-display text-xl font-bold">Recently cooked</h2>
+          <div className="mt-3 flex flex-wrap gap-3">
+            {recentlyCooked.map((r) => (
+              <button key={r.id} type="button" onClick={() => onOpenRecipe(r.id)} className="w-24 text-left" aria-label={`Open ${r.title}`}>
+                {r.dishPhotoUrl || r.sourcePhotoUrl ? (
+                  <img src={r.dishPhotoUrl ?? r.sourcePhotoUrl ?? ""} alt="" className="h-24 w-24 rounded-lg object-cover" style={{ border: "1px solid var(--border)" }} />
+                ) : (
+                  <span className="flex h-24 w-24 items-center justify-center rounded-lg text-3xl" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }} aria-hidden>🍽️</span>
+                )}
+                <span className="mt-1 block truncate text-xs font-semibold">{r.title}</span>
+                {r.lastCookedAt && <span className="block text-xs" style={{ color: "var(--dim)" }}>{prettyDate(r.lastCookedAt)}</span>}
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="What you are sharing">
+        <h2 className="font-display text-xl font-bold">What you’re sharing</h2>
+        {myShares.length > 0 ? (
+          <ul className="mt-3 space-y-2">
+            {myShares.map((s) => (
+              <li key={s.shareKey} className="flex items-center gap-3 rounded-lg px-3 py-2" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-bold">{s.kind === "collection" ? "📚 " : "🍽️ "}{s.title}</p>
+                  <p className="text-xs" style={{ color: "var(--dim)" }}>{s.synced ? "Shared with your friends" : "Will be sent when friends check in"}</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => onUnshare(s.shareKey)}
+                  className="rounded-full px-3 py-1.5 text-xs font-semibold"
+                  style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)" }}
+                >
+                  Stop sharing
+                </button>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>
+            You’re not sharing anything yet — share a recipe from its own page, or a whole collection from the Friends tab.
+          </p>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function FriendProfilePage({
+  friend, shared, detailShares, savedIds, busy, onBack, onSaveShared, onOpenRecipe, onRemove,
+}: {
+  friend: FriendInfo;
+  shared: FriendsInfo["sharedWithMe"];
+  detailShares: Array<{
+    shareKey: string;
+    kind: "recipe" | "collection";
+    title: string;
+    photoData: string | null;
+    cooked: Array<{ title: string; lastCookedAt: string | null; photoData: string | null }>;
+  }>;
+  savedIds: Record<string, number | null>;
+  busy: boolean;
+  onBack: () => void;
+  onSaveShared: (shareKey: string) => void;
+  onOpenRecipe: (id: number) => void;
+  onRemove: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+  const [confirmingRemove, setConfirmingRemove] = useState(false);
+  const name = friend.displayName || friend.username;
+  const firstName = name.split(" ")[0] ?? name;
+  const photoByShare = new Map(detailShares.map((s) => [s.shareKey, s.photoData]));
+  const recentlyCooked = detailShares
+    .flatMap((s) => s.cooked.map((c) => ({ ...c, photoData: c.photoData ?? s.photoData })))
+    .slice()
+    .sort((a, b) => (b.lastCookedAt ?? "").localeCompare(a.lastCookedAt ?? ""))
+    .slice(0, 6);
+  const recipesShared = shared.filter((s) => s.kind === "recipe").length;
+  const collectionsShared = shared.filter((s) => s.kind === "collection").length;
+
+  return (
+    <div>
+      <button type="button" onClick={onBack} className="text-sm font-semibold" style={{ color: "var(--herb)" }}>
+        ‹ Back to Friends
+      </button>
+
+      <section className="mt-3 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label={`${name}'s profile`}>
+        <div className="flex items-center gap-3">
+          <Avatar name={name} photoData={friend.photoData} size={72} />
+          <div className="min-w-0">
+            <h1 className="truncate font-display text-2xl font-bold">{name}</h1>
+            <p className="text-sm" style={{ color: "var(--dim)" }}>@{friend.username}</p>
+            {friend.location && <p className="text-sm" style={{ color: "var(--dim)" }}>📍 {friend.location}</p>}
+            {friend.joinedAt && prettyInstant(friend.joinedAt) && <p className="text-sm" style={{ color: "var(--dim)" }}>Cooking with Kitchen Companion since {prettyInstant(friend.joinedAt)}</p>}
+          </div>
+        </div>
+        {friend.bio && <p className="mt-3 text-base leading-relaxed">{friend.bio}</p>}
+        <SpecialtyChips items={friend.specialties} />
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <span className="font-display text-base font-bold tracking-wide">{friend.kcId}</span>
+          <button
+            type="button"
+            onClick={async () => setCopied(await copyText(friend.kcId))}
+            className="rounded-full px-4 py-2 text-sm font-semibold"
+            style={{ background: "var(--surface2)", color: "var(--text)", border: "1px solid var(--border)" }}
+          >
+            {copied ? "✓ Code copied" : "📋 Copy code"}
+          </button>
+        </div>
+        <ProfileCounts counts={[
+          ["Recipes shared", recipesShared],
+          ["Collections shared", collectionsShared],
+        ]} />
+      </section>
+
+      {recentlyCooked.length > 0 && (
+        <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label={`${firstName} recently cooked`}>
+          <h2 className="font-display text-xl font-bold">Recently cooked</h2>
+          <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>From the recipes {firstName} has shared with friends.</p>
+          <div className="mt-3 flex flex-wrap gap-3">
+            {recentlyCooked.map((c, i) => (
+              <div key={`${c.title}-${i}`} className="w-24">
+                {c.photoData ? (
+                  <img src={c.photoData} alt="" className="h-24 w-24 rounded-lg object-cover" style={{ border: "1px solid var(--border)" }} />
+                ) : (
+                  <span className="flex h-24 w-24 items-center justify-center rounded-lg text-3xl" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }} aria-hidden>🍽️</span>
+                )}
+                <span className="mt-1 block truncate text-xs font-semibold">{c.title}</span>
+                {c.lastCookedAt && <span className="block text-xs" style={{ color: "var(--dim)" }}>{prettyDate(c.lastCookedAt)}</span>}
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label={`Shared by ${firstName}`}>
+        <h2 className="font-display text-xl font-bold">Shared by {firstName}</h2>
+        {shared.length > 0 ? (
+          <ul className="mt-3 space-y-2">
+            {shared.map((s) => {
+              const savedId = savedIds[s.shareKey];
+              const isSaved = s.shareKey in savedIds;
+              const photo = photoByShare.get(s.shareKey) ?? null;
+              return (
+                <li key={s.shareKey} className="flex items-center gap-3 rounded-lg px-3 py-3" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
+                  {photo ? (
+                    <img src={photo} alt="" className="h-14 w-14 shrink-0 rounded-lg object-cover" style={{ border: "1px solid var(--border)" }} />
+                  ) : (
+                    <span className="flex h-14 w-14 shrink-0 items-center justify-center rounded-lg text-2xl" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-hidden>{s.kind === "collection" ? "📚" : "🍽️"}</span>
+                  )}
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-sm font-bold">{s.title}</p>
+                    <p className="text-xs" style={{ color: "var(--dim)" }}>{s.kind === "collection" ? "A whole collection" : "A recipe"}</p>
+                    {isSaved ? (
+                      <button
+                        type="button"
+                        disabled={savedId == null}
+                        onClick={() => savedId != null && onOpenRecipe(savedId)}
+                        className="mt-1.5 rounded-full px-3 py-1.5 text-xs font-semibold disabled:opacity-60"
+                        style={{ background: "var(--surface)", color: "var(--herb)", border: "1px solid var(--border)" }}
+                      >
+                        {savedId != null ? "✓ Saved — open it" : "✓ Already in your library"}
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => onSaveShared(s.shareKey)}
+                        disabled={busy}
+                        className="mt-1.5 rounded-full px-3 py-1.5 text-xs font-bold disabled:opacity-50"
+                        style={{ background: "var(--herb)", color: "#10240c" }}
+                      >
+                        Save to my recipes
+                      </button>
+                    )}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        ) : (
+          <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>
+            {firstName} hasn’t shared anything yet. When {firstName} shares a recipe or a collection with friends, it will show up right here.
+          </p>
+        )}
+      </section>
+
+      <button
+        type="button"
+        onClick={() => (confirmingRemove ? onRemove() : setConfirmingRemove(true))}
+        disabled={busy}
+        className="mt-4 rounded-full px-4 py-2 text-sm font-semibold disabled:opacity-50"
+        style={{ background: "var(--surface)", color: confirmingRemove ? "var(--accent)" : "var(--text)", border: "1px solid var(--border)" }}
+      >
+        {confirmingRemove ? "Tap again to remove" : `Remove ${firstName} from my friends`}
+      </button>
     </div>
   );
 }
@@ -3672,7 +4218,7 @@ function fmtDateTime(iso: string): string {
 }
 
 function SettingsView({
-  updateInfo, checking, onRecheck, profile, friendsOnline, recoveryKey, onShowTutorial,
+  updateInfo, checking, onRecheck, profile, friendsOnline, recoveryKey, onShowTutorial, onViewProfile,
 }: {
   updateInfo: UpdateInfo | null;
   checking: boolean;
@@ -3681,6 +4227,7 @@ function SettingsView({
   friendsOnline: boolean;
   recoveryKey: string | null;
   onShowTutorial: () => void;
+  onViewProfile: () => void;
 }) {
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
   const queryClient = useQueryClient();
@@ -3770,6 +4317,14 @@ function SettingsView({
             </div>
           </div>
           <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={onViewProfile}
+              className="rounded-full px-4 py-2 text-sm font-bold"
+              style={{ background: "var(--herb)", color: "#10240c" }}
+            >
+              View my profile page
+            </button>
             <button
               type="button"
               onClick={async () => setCodeCopied(await copyText(profile.kcId))}
