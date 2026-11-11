@@ -3,6 +3,12 @@
 Every version, newest first. These are the same notes the app shows in
 Settings → App updates — one list, plain and simple.
 
+## v1.8.0 — 2026-11-11
+- New in Settings: Share Kitchen Companion — a way to give the app to family and friends.
+- It writes a short note for you to send them; they paste it into their own Muse, and their Muse sets the app up for them.
+- The note sets them up on version 1.7.1 — the same copy Liz is running now.
+- Their copy is their own — their own recipes, name, and code — and once they're set up you can add each other as friends and share recipes.
+
 ## v1.7.1 — 2026-11-10
 - Fixed: a recipe photo that's too faint or blurry to read no longer turns into scrambled nonsense words.
 - If a page can't be read clearly, the app says so up front and keeps your photo with the recipe, so you can type from it or take the photo again in better light.

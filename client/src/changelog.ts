@@ -18,6 +18,16 @@ export type VersionNotes = {
 
 export const CHANGELOG: VersionNotes[] = [
   {
+    version: "1.8.0",
+    date: "2026-11-11",
+    notes: [
+      "New in Settings: Share Kitchen Companion — a way to give the app to family and friends.",
+      "It writes a short note for you to send them; they paste it into their own Muse, and their Muse sets the app up for them.",
+      "The note sets them up on version 1.7.1 — the same copy Liz is running now.",
+      "Their copy is their own — their own recipes, name, and code — and once they're set up you can add each other as friends and share recipes.",
+    ],
+  },
+  {
     version: "1.7.1",
     date: "2026-11-10",
     notes: [

@@ -154,7 +154,23 @@ const JEWEL_URL = "https://www.jewelosco.com/";
 
 // Visible version (Anthony's standing rule: the UAT carries its version
 // number in the app, and the GitHub push of this build is tagged with it).
-const APP_VERSION = "1.7.1";
+const APP_VERSION = "1.8.0";
+
+// Where every copy of Kitchen Companion comes from: the public GitHub repo
+// (the same address the update check reads). Settings' share section hands
+// this link out in a plain-words note for a friend or family member's own
+// Muse to install their own copy from.
+const KC_REPO_URL = "https://github.com/aruikis/Kitchen-Companion";
+
+// The version the Settings share note installs — FIXED on purpose
+// (Anthony's direction, Nov 11, 2026): his sister's copy must be the copy
+// Liz is running right now, version 1.7.1 — the most updated copy there
+// is. It must NOT float to "the latest tagged version": this app itself
+// is already 1.8.0, so a floating note would hand her 1.8.0 the moment
+// that tag lands instead of Liz's 1.7.1. The link goes to the exact
+// v1.7.1 tag page, never the repo root.
+const KC_SHARE_VERSION = "1.7.1";
+const KC_SHARE_TAG_URL = `${KC_REPO_URL}/tree/v${KC_SHARE_VERSION}`;
 
 // Automatic categories (chosen by the app when a recipe is added; the cook
 // can correct them). Mirrors the server's lists in actions.ts.
@@ -4743,6 +4759,8 @@ function SettingsView({
   collections: Collection[];
 }) {
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+  const [inviteCopyState, setInviteCopyState] = useState<"idle" | "copied" | "failed">("idle");
+  const [inviteShareState, setInviteShareState] = useState<"idle" | "shared" | "copied" | "failed">("idle");
   const queryClient = useQueryClient();
   const backupStatusQ = useQuery({ queryKey: ["backupStatus"], queryFn: () => api.getBackupStatus({}) });
   const backupStatus = backupStatusQ.data ?? null;
@@ -4759,6 +4777,17 @@ function SettingsView({
   const updateText = latest
     ? `Please update my Kitchen Companion app to the latest version, v${latest}. Get it from the public GitHub repo: https://github.com/aruikis/Kitchen-Companion — use the version tagged v${latest}. Please keep all of my recipes, collections, and settings exactly as they are, install the new version the same way this app was installed before, and when it's done, tell me what's new in it.`
     : "";
+
+  // The note a friend or family member hands to THEIR OWN Muse to get
+  // their own Kitchen Companion (Settings → Share Kitchen Companion,
+  // v1.8.0). Plain words on purpose: the whole ask is "install my own copy
+  // from the repo and walk me through first setup". The version is PINNED
+  // to v1.7.1 (KC_SHARE_VERSION / KC_SHARE_TAG_URL) — the copy Liz is
+  // running now — and deliberately does NOT use the update check's
+  // latest version: once v1.8.0 is tagged, "latest" would hand the
+  // recipient 1.8.0 instead of Liz's 1.7.1. Their copy starts empty with
+  // their own profile and code — it is never a copy of this library.
+  const inviteText = `Please set up Kitchen Companion for me — it's a recipe app that a friend sent me. Get it from the public GitHub repo, at this exact version: version ${KC_SHARE_VERSION}, tagged v${KC_SHARE_VERSION} here: ${KC_SHARE_TAG_URL} — please use that v${KC_SHARE_VERSION} version exactly, not a newer version, and install it as my own copy in my own Muse account, the same way it was installed for the person who sent me this note. When it's ready, open it with me and walk me through the first-time setup: I'll pick a username and get my own Kitchen Companion code (it looks like KC-XXXX-XXXX). My copy starts empty — it's my own recipe library, not a copy of anyone else's. Once I'm set up, show me how to add my friend as a friend using their code, so we can share recipes with each other.`;
 
   const saveDisplayName = async () => {
     if (!profile) return;
@@ -5088,6 +5117,94 @@ function SettingsView({
             </div>
           ))}
         </div>
+      </section>
+
+      <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="Share Kitchen Companion">
+        <h2 className="font-display text-xl font-bold">💌 Share Kitchen Companion</h2>
+        <p className="mt-1 text-sm" style={{ color: "var(--dim)" }}>
+          Want a friend or family member to have Kitchen Companion too? There’s no app-store
+          link to send — every copy lives in its owner’s own Muse account, like yours does.
+          Instead, send them the short note below. They paste it into their own chat with
+          Muse, and their Muse sets up <strong style={{ color: "var(--text)" }}>their own copy</strong> for
+          them, from the same place yours came from.
+        </p>
+        <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>
+          Their copy is theirs: it starts empty, with their own recipes, their own username,
+          and their own Kitchen Companion code. Once they’re set up, swap codes — yours is in
+          Your profile, just above — add each other as friends, and you can share recipes
+          with each other from the Friends tab.
+        </p>
+        <p className="mt-2 text-sm" style={{ color: "var(--dim)" }}>
+          The note sets them up on <strong style={{ color: "var(--text)" }}>version {KC_SHARE_VERSION}</strong> —
+          the copy Liz is running right now, the most updated copy there is.
+        </p>
+        <h3 className="mt-4 text-sm font-bold">Send them this note</h3>
+        <div className="mt-2 rounded-lg px-3 py-2 text-sm" style={{ background: "var(--surface2)", border: "1px solid var(--border)" }}>
+          {inviteText}
+        </div>
+        <div className="mt-2 flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={async () => {
+              const res = await shareOut("Kitchen Companion", inviteText);
+              setInviteShareState(res);
+              if (res === "copied") setInviteCopyState("copied");
+            }}
+            className="rounded-full px-4 py-2 text-sm font-bold"
+            style={{ background: "var(--herb)", color: "#10240c" }}
+          >
+            📤 Send the note…
+          </button>
+          <button
+            type="button"
+            onClick={async () => setInviteCopyState((await copyText(inviteText)) ? "copied" : "failed")}
+            className="rounded-full px-4 py-2 text-sm font-semibold"
+            style={{ background: "var(--surface2)", color: "var(--text)", border: "1px solid var(--border)" }}
+          >
+            {inviteCopyState === "copied" ? "✓ Note copied" : "📋 Copy the note"}
+          </button>
+          <a
+            href={KC_SHARE_TAG_URL}
+            target="_blank"
+            rel="noreferrer"
+            className="rounded-full px-4 py-2 text-sm font-semibold"
+            style={{ background: "var(--surface2)", border: "1px solid var(--border)", color: "var(--text)" }}
+          >
+            Open the v{KC_SHARE_VERSION} tag page ↗
+          </a>
+        </div>
+        {inviteShareState === "shared" && (
+          <p className="mt-2 text-sm" role="status" style={{ color: "var(--herb)" }}>
+            Sent — when they paste it into their Muse, their copy gets set up for them.
+          </p>
+        )}
+        {inviteShareState === "copied" && (
+          <p className="mt-2 text-sm" role="status" style={{ color: "var(--herb)" }}>
+            This phone couldn’t open the send panel, so the note is copied instead — paste it into a message to them.
+          </p>
+        )}
+        {inviteCopyState === "copied" && inviteShareState !== "copied" && (
+          <p className="mt-2 text-sm" role="status" style={{ color: "var(--herb)" }}>
+            Copied — now paste it into a message to them. When they paste it into their own Muse, their copy gets set up for them.
+          </p>
+        )}
+        {(inviteCopyState === "failed" || inviteShareState === "failed") && (
+          <div className="mt-2" role="status">
+            <p className="text-sm font-medium" style={{ color: "var(--accent)" }}>
+              Copying isn’t available in this browser — here’s the note to copy by hand:
+            </p>
+            <label htmlFor="invite-note-text" className="sr-only">The share note as text</label>
+            <textarea
+              id="invite-note-text"
+              readOnly
+              value={inviteText}
+              rows={6}
+              onFocus={(e) => e.target.select()}
+              className="mt-1 w-full rounded-lg px-3 py-2 text-sm outline-none"
+              style={{ background: "var(--surface2)", border: "1px solid var(--border)", color: "var(--text)" }}
+            />
+          </div>
+        )}
       </section>
 
       <section className="mt-4 rounded-[var(--radius)] px-4 py-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }} aria-label="Backup and safety">
